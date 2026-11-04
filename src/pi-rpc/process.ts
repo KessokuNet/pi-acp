@@ -83,11 +83,13 @@ type SpawnParams = {
    */
   additionalDirectories?: readonly string[]
   /**
-   * Path to a generated MCP config passed to pi-mcp-adapter via `--mcp-config`. pi ignores the flag
-   * (it's an extension flag), and the adapter reads it as its pi-global config source — so we never
-   * write into pi's own `<cwd>/.pi/` config namespace.
+   * Path to a generated MCP config passed to pi-mcp-adapter via `--mcp-config`, which the adapter
+   * reads as its pi-global config source — so we never write into pi's own `<cwd>/.pi/` config
+   * namespace. Only set when the adapter is installed: see the spawn note below.
    */
   mcpConfigPath?: string
+  /** Extra environment for the pi child (e.g. the client's combiner session URL). */
+  env?: Record<string, string>
   /** Per-request RPC timeout (ms). Falls back to {@link DEFAULT_RPC_TIMEOUT_MS} when unset. */
   rpcTimeoutMs?: number
 }
@@ -113,6 +115,8 @@ export type PiRpcExitInfo = { code: number | null; signal: NodeJS.Signals | null
 /** Default per-request timeout (ms). Generous so legitimately slow commands (e.g. compaction) finish. */
 const DEFAULT_RPC_TIMEOUT_MS = 120_000
 
+const MAX_STDERR_TAIL = 4096
+
 export class PiRpcProcess {
   private readonly child: ChildProcessWithoutNullStreams
   private readonly pending = new Map<
@@ -123,6 +127,8 @@ export class PiRpcProcess {
   private exitHandlers: Array<(info: PiRpcExitInfo) => void> = []
   private readonly preludeLines: string[] = []
   private readonly rpcTimeoutMs: number
+  private stderrTail = ''
+  private exitError: Error | null = null
 
   private constructor(child: ChildProcessWithoutNullStreams, rpcTimeoutMs?: number) {
     this.child = child
@@ -162,8 +168,16 @@ export class PiRpcProcess {
       for (const h of this.eventHandlers) h(msg as PiRpcEvent)
     })
 
+    // Kept so an early exit (e.g. pi rejecting a CLI flag) reports pi's own message instead of a
+    // downstream "write after a stream was destroyed".
+    child.stderr.on('data', (chunk: Buffer) => {
+      this.stderrTail = (this.stderrTail + chunk.toString('utf-8')).slice(-MAX_STDERR_TAIL)
+    })
+
     child.on('exit', (code, signal) => {
-      const err = new Error(`pi process exited (code=${code}, signal=${signal})`)
+      const stderr = stripAnsi(this.stderrTail).trim()
+      const err = new Error(`pi process exited (code=${code}, signal=${signal})${stderr ? `: ${stderr}` : ''}`)
+      this.exitError = err
       this.rejectAllPending(err)
       // Notify higher layers (e.g. PiAcpSession) so an in-flight turn awaiting `agent_settled`
       // doesn't hang forever when pi dies mid-turn.
@@ -200,8 +214,9 @@ export class PiRpcProcess {
     // (e.g. MCP extensions, prompt templates for workflows).
     const args = ['--mode', 'rpc', '--no-themes']
     if (params.sessionPath) args.push('--session', params.sessionPath)
-    // pi treats unknown `--` flags as extension flags (no error in rpc mode); pi-mcp-adapter reads
-    // `--mcp-config` from argv. This overrides only the adapter's pi-global source, not pi's config dir.
+    // `--mcp-config` is pi-mcp-adapter's registered flag. pi matches leftover `--` flags against the
+    // flags of loaded extensions and exits (all modes) on any unmatched one, so callers must only
+    // pass this when the adapter is installed (writeMcpConfigForPi).
     if (params.mcpConfigPath) args.push('--mcp-config', params.mcpConfigPath)
 
     // Workspace roots go through `--append-system-prompt`, which pi resolves from a
@@ -231,7 +246,7 @@ export class PiRpcProcess {
       stdio: 'pipe',
       // Mark the spawned pi as running under the ACP adapter so the bundled pi extension
       // (subagent → plan bridge) activates here but stays inert in a normal terminal `pi`.
-      env: { ...process.env, PI_ACP: '1' },
+      env: { ...process.env, ...params.env, PI_ACP: '1' },
       shell: shouldUseShellForPiCommand(cmd)
     })
 
@@ -276,10 +291,6 @@ export class PiRpcProcess {
 
       throw new PiRpcSpawnError(`Could not start pi (command: ${cmd}).`, { code, cause: e })
     }
-
-    child.stderr.on('data', () => {
-      // leave stderr untouched; ACP clients may capture it.
-    })
 
     const proc = new PiRpcProcess(child, params.rpcTimeoutMs)
 
@@ -458,6 +469,10 @@ export class PiRpcProcess {
 
   private writeLine(line: string): Promise<void> {
     return new Promise<void>((resolve, reject) => {
+      if (this.exitError) {
+        reject(this.exitError)
+        return
+      }
       try {
         this.child.stdin.write(line, error => {
           if (error) {

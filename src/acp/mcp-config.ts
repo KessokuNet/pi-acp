@@ -1,9 +1,11 @@
+import { execFile } from 'node:child_process'
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { McpServer } from '@agentclientprotocol/sdk'
 import { getAgentDir } from './pi-settings.js'
 import { getPiAcpMcpPolicyPath } from './paths.js'
+import { getPiCommand, shouldUseShellForPiCommand } from '../pi-rpc/command.js'
 
 // Marker written into generated configs so we only ever overwrite / clean up files
 // that pi-acp authored, never a hand-written `.pi/mcp.json`.
@@ -259,19 +261,127 @@ export function cleanupStaleGeneratedConfig(cwd: string): void {
   }
 }
 
-/** Best-effort check of pi settings for a `pi-mcp-adapter` package entry. */
-export function piMcpAdapterInstalled(cwd: string): boolean {
-  const settingsPaths = [join(getAgentDir(), 'settings.json'), join(cwd, '.pi', 'settings.json')]
-  for (const p of settingsPaths) {
-    try {
-      const settings = JSON.parse(readFileSync(p, 'utf-8')) as { packages?: unknown }
-      const pkgs = Array.isArray(settings.packages) ? settings.packages : []
-      if (pkgs.some(pkg => typeof pkg === 'string' && pkg.includes('pi-mcp-adapter'))) return true
-    } catch {
-      // ignore missing / invalid settings
-    }
+/**
+ * {@link writeMcpConfig}, but only when pi will load pi-mcp-adapter. `--mcp-config` is that
+ * extension's flag; without an extension registering it pi rejects it as an unknown option and
+ * exits before RPC starts (e.g. when pi-mcp-combiner replaces the adapter and reads its own config).
+ */
+export async function writeMcpConfigForPi(
+  cwd: string,
+  servers: readonly McpServer[] | undefined | null,
+  piCommand?: string
+): Promise<WriteMcpConfigResult> {
+  if (!servers?.length || !(await piMcpAdapterLoaded(cwd, piCommand))) {
+    return { handle: null, skipped: [], preserved: [] }
   }
-  return false
+  return writeMcpConfig(servers)
+}
+
+const COMBINER_SESSION_HEADER = 'x-mcp-combiner-session'
+
+/**
+ * Env for the pi child when the client injected an mcp-combiner entry (mcp-companion does this per
+ * chat). Mirrors mcp-companion's CLI path (`env MCP_COMPANION_COMBINER_URL=<url>/<token> <agent>`):
+ * pi-mcp-combiner then joins the editor's per-chat combiner session (neovim_* routing, per-chat
+ * server filter) and treats the combiner as host-owned instead of launching its own. pi-mcp-combiner
+ * reads the token only from the URL path, so a header-only token is folded into `/mcp/<token>`.
+ */
+export function combinerEnvFor(servers: readonly McpServer[] | undefined | null): Record<string, string> {
+  for (const server of servers ?? []) {
+    if ((server as { type?: string }).type !== 'http') continue
+    const http = server as { url?: string; headers?: NameValue[] }
+    const token = (http.headers ?? []).find(h => h?.name?.toLowerCase() === COMBINER_SESSION_HEADER)?.value
+    const url = String(http.url ?? '')
+      .trim()
+      .replace(/\/+$/, '')
+    if (!token || !url) continue
+    return { MCP_COMPANION_COMBINER_URL: url.endsWith(`/${token}`) ? url : `${url}/${token}` }
+  }
+  return {}
+}
+
+const MCP_ADAPTER_PACKAGE = 'pi-mcp-adapter'
+
+/**
+ * The adapter's entry in one settings file: `'loaded'`, `'disabled'` (object form with
+ * `extensions: []`, so its flags are never registered), or `undefined` when not listed.
+ */
+function adapterEntryState(settingsPath: string): 'loaded' | 'disabled' | undefined {
+  let pkgs: unknown[]
+  try {
+    const settings = JSON.parse(readFileSync(settingsPath, 'utf-8')) as { packages?: unknown }
+    pkgs = Array.isArray(settings.packages) ? settings.packages : []
+  } catch {
+    return undefined
+  }
+  for (const pkg of pkgs) {
+    if (typeof pkg === 'string') {
+      if (pkg.includes(MCP_ADAPTER_PACKAGE)) return 'loaded'
+      continue
+    }
+    const entry = pkg as { source?: unknown; extensions?: unknown } | null
+    if (typeof entry?.source !== 'string' || !entry.source.includes(MCP_ADAPTER_PACKAGE)) continue
+    return Array.isArray(entry.extensions) && entry.extensions.length === 0 ? 'disabled' : 'loaded'
+  }
+  return undefined
+}
+
+/**
+ * Best-effort check that pi will load `pi-mcp-adapter` (and so register `--mcp-config`). A project
+ * entry replaces the personal one. A false positive makes pi exit on an unknown option, so a
+ * listed-but-disabled entry counts as not installed.
+ */
+export function piMcpAdapterInstalled(cwd: string): boolean {
+  const state =
+    adapterEntryState(join(cwd, '.pi', 'settings.json')) ?? adapterEntryState(join(getAgentDir(), 'settings.json'))
+  return state === 'loaded'
+}
+
+export type PiListAdapterState = 'installed' | 'filtered' | 'absent'
+
+/**
+ * Parse `pi list` for the adapter. Entries are `  <source>[ (filtered)]`, followed by an indented
+ * install-path line only when the package is on disk. A later (project) entry replaces an earlier
+ * (user) one. `filtered` means some resource filter is set — not necessarily on extensions.
+ */
+export function parsePiListAdapter(output: string): PiListAdapterState {
+  const lines = output.split(/\r?\n/)
+  let state: PiListAdapterState = 'absent'
+  for (let i = 0; i < lines.length; i++) {
+    const m = /^ {2}(\S+)( \(filtered\))?\s*$/.exec(lines[i] ?? '')
+    if (!m?.[1]?.includes(MCP_ADAPTER_PACKAGE)) continue
+    const onDisk = /^ {4,}\S/.test(lines[i + 1] ?? '')
+    if (!onDisk) state = 'absent'
+    else state = m[2] ? 'filtered' : 'installed'
+  }
+  return state
+}
+
+const PI_LIST_TIMEOUT_MS = 10_000
+
+function runPiList(cwd: string, piCommand?: string): Promise<string | undefined> {
+  const cmd = getPiCommand(piCommand)
+  return new Promise(resolve => {
+    execFile(
+      cmd,
+      ['list'],
+      { cwd, timeout: PI_LIST_TIMEOUT_MS, shell: shouldUseShellForPiCommand(cmd), encoding: 'utf-8' },
+      (error, stdout) => resolve(error ? undefined : stdout)
+    )
+  })
+}
+
+/**
+ * Whether pi will load pi-mcp-adapter for `cwd`, asked of `pi list` so pi's own scope and project
+ * trust rules apply (an untrusted project's packages are not listed). The settings files are only
+ * consulted for a filtered entry (is it `extensions: []`?) or when `pi list` fails.
+ */
+export async function piMcpAdapterLoaded(cwd: string, piCommand?: string): Promise<boolean> {
+  const output = await runPiList(cwd, piCommand)
+  if (output === undefined) return piMcpAdapterInstalled(cwd)
+  const state = parsePiListAdapter(output)
+  if (state === 'filtered') return piMcpAdapterInstalled(cwd)
+  return state === 'installed'
 }
 
 /**

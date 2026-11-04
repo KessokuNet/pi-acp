@@ -86,6 +86,7 @@ test('PiAcpAgent: prompt auto-restores a missing session from SessionStore', asy
         piCommand: undefined,
         additionalDirectories: undefined,
         mcpConfigPath: undefined,
+        env: {},
         rpcTimeoutMs: 120000
       }
     ])
@@ -185,6 +186,7 @@ test('PiAcpAgent: setSessionConfigOption auto-restores via pi session discovery 
         piCommand: undefined,
         additionalDirectories: undefined,
         mcpConfigPath: undefined,
+        env: {},
         rpcTimeoutMs: 120000
       }
     ])

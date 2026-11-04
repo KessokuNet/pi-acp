@@ -56,6 +56,8 @@ type SessionCreateParams = {
   additionalDirectories?: string[]
   /** Path to the generated MCP config temp file, passed to pi via `--mcp-config`. */
   mcpConfigPath?: string
+  /** Extra environment for the pi child (see `combinerEnvFor`). */
+  env?: Record<string, string>
   /** Cleanup for the generated MCP config temp file, invoked when the session is closed. */
   mcpConfigCleanup?: () => void
   /** Full ACP client capabilities from initialize, used to gate wire features (terminals, plan, fs). */
@@ -237,6 +239,7 @@ export class SessionManager {
         piCommand: params.piCommand,
         additionalDirectories: params.additionalDirectories,
         mcpConfigPath: params.mcpConfigPath,
+        env: params.env,
         rpcTimeoutMs: params.rpcTimeoutMs
       })
     } catch (e) {

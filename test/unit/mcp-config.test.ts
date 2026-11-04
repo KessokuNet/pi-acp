@@ -7,10 +7,31 @@ import type { McpServer } from '@agentclientprotocol/sdk'
 import {
   translateMcpServers,
   writeMcpConfig,
+  writeMcpConfigForPi,
+  piMcpAdapterInstalled,
+  parsePiListAdapter,
   buildMcpNotice,
   loadMcpPolicy,
-  cleanupStaleGeneratedConfig
+  cleanupStaleGeneratedConfig,
+  combinerEnvFor
 } from '../../src/acp/mcp-config.js'
+
+test('combinerEnvFor: passes the tokened combiner URL through when the client sends one', () => {
+  const header = (token: string) => [{ name: 'X-MCP-Combiner-Session', value: token }]
+  assert.deepEqual(
+    combinerEnvFor([
+      { type: 'http', name: 'mcp-combiner', url: 'http://127.0.0.1:9741/mcp/tok', headers: header('tok') }
+    ]),
+    { MCP_COMPANION_COMBINER_URL: 'http://127.0.0.1:9741/mcp/tok' }
+  )
+  // token_in_url=false on the client: header-only token is folded into the path.
+  assert.deepEqual(
+    combinerEnvFor([{ type: 'http', name: 'mcp-combiner', url: 'http://127.0.0.1:9741/mcp/', headers: header('tok') }]),
+    { MCP_COMPANION_COMBINER_URL: 'http://127.0.0.1:9741/mcp/tok' }
+  )
+  assert.deepEqual(combinerEnvFor([{ type: 'http', name: 'other', url: 'http://x/mcp', headers: [] }]), {})
+  assert.deepEqual(combinerEnvFor(undefined), {})
+})
 
 function tmpCwd(): string {
   return mkdtempSync(join(tmpdir(), 'pi-acp-mcp-'))
@@ -125,6 +146,100 @@ test('buildMcpNotice: warns when adapter missing and lists skipped servers', () 
     assert.ok(notice)
     assert.match(notice!, /pi-mcp-adapter/)
     assert.match(notice!, /streamy/)
+  } finally {
+    if (prev === undefined) delete process.env.PI_CODING_AGENT_DIR
+    else process.env.PI_CODING_AGENT_DIR = prev
+    rmSync(cwd, { recursive: true, force: true })
+    rmSync(agentDir, { recursive: true, force: true })
+  }
+})
+
+const PI_LIST_HEADER = 'User packages:\n  npm:pi-lens\n    /agent/npm/node_modules/pi-lens\n'
+
+test('parsePiListAdapter: installed / filtered / absent, project entry wins', () => {
+  assert.equal(parsePiListAdapter(PI_LIST_HEADER), 'absent')
+  assert.equal(
+    parsePiListAdapter(`${PI_LIST_HEADER}  npm:pi-mcp-adapter\n    /agent/npm/node_modules/pi-mcp-adapter\n`),
+    'installed'
+  )
+  assert.equal(
+    parsePiListAdapter(
+      `${PI_LIST_HEADER}  npm:pi-mcp-adapter (filtered)\n    /agent/npm/node_modules/pi-mcp-adapter\n`
+    ),
+    'filtered'
+  )
+  // Listed but not on disk (no install-path line).
+  assert.equal(parsePiListAdapter(`${PI_LIST_HEADER}  npm:pi-mcp-adapter\n  npm:pi-notify\n`), 'absent')
+  assert.equal(
+    parsePiListAdapter(
+      `${PI_LIST_HEADER}  npm:pi-mcp-adapter\n    /agent/npm/node_modules/pi-mcp-adapter\n` +
+        'Project packages:\n  npm:pi-mcp-adapter (filtered)\n    /proj/.pi/npm/node_modules/pi-mcp-adapter\n'
+    ),
+    'filtered'
+  )
+})
+
+function fakePi(dir: string, listOutput: string): string {
+  const path = join(dir, 'fake-pi')
+  writeFileSync(path, `#!/bin/sh\ncat <<'EOF'\n${listOutput}EOF\n`, { mode: 0o755 })
+  return path
+}
+
+test(
+  'writeMcpConfigForPi: gates on `pi list`, falls back to settings when it fails',
+  { skip: process.platform === 'win32' },
+  async () => {
+    const cwd = tmpCwd()
+    const agentDir = tmpCwd()
+    const prev = process.env.PI_CODING_AGENT_DIR
+    process.env.PI_CODING_AGENT_DIR = agentDir
+    const servers: McpServer[] = [{ type: 'http', name: 'combiner', url: 'http://127.0.0.1:9741/mcp', headers: [] }]
+    try {
+      // Settings list the adapter, but pi (e.g. an untrusted project) does not — pi list wins.
+      writeFileSync(join(agentDir, 'settings.json'), JSON.stringify({ packages: ['npm:pi-mcp-adapter'] }))
+      assert.equal((await writeMcpConfigForPi(cwd, servers, fakePi(agentDir, PI_LIST_HEADER))).handle, null)
+
+      const listed = `${PI_LIST_HEADER}  npm:pi-mcp-adapter\n    /agent/npm/node_modules/pi-mcp-adapter\n`
+      const res = await writeMcpConfigForPi(cwd, servers, fakePi(agentDir, listed))
+      assert.ok(res.handle)
+      assert.ok(existsSync(res.handle!.path))
+      res.handle!.cleanup()
+
+      // pi list unavailable → settings decide.
+      assert.ok((await writeMcpConfigForPi(cwd, servers, join(agentDir, 'missing-pi'))).handle)
+      writeFileSync(join(agentDir, 'settings.json'), JSON.stringify({ packages: ['npm:@geohar/pi-mcp-combiner'] }))
+      assert.equal((await writeMcpConfigForPi(cwd, servers, join(agentDir, 'missing-pi'))).handle, null)
+    } finally {
+      if (prev === undefined) delete process.env.PI_CODING_AGENT_DIR
+      else process.env.PI_CODING_AGENT_DIR = prev
+      rmSync(cwd, { recursive: true, force: true })
+      rmSync(agentDir, { recursive: true, force: true })
+    }
+  }
+)
+
+test('piMcpAdapterInstalled: settings fallback handles object form and project override', () => {
+  const cwd = tmpCwd()
+  const agentDir = tmpCwd()
+  const prev = process.env.PI_CODING_AGENT_DIR
+  process.env.PI_CODING_AGENT_DIR = agentDir
+  try {
+    // Object form: listed with no extensions loads no flags, so it must not count as installed.
+    writeFileSync(
+      join(agentDir, 'settings.json'),
+      JSON.stringify({ packages: [{ source: 'npm:pi-mcp-adapter', extensions: [] }] })
+    )
+    assert.equal(piMcpAdapterInstalled(cwd), false)
+    writeFileSync(join(agentDir, 'settings.json'), JSON.stringify({ packages: [{ source: 'npm:pi-mcp-adapter' }] }))
+    assert.equal(piMcpAdapterInstalled(cwd), true)
+
+    // A project entry replaces the personal one.
+    mkdirSync(join(cwd, '.pi'), { recursive: true })
+    writeFileSync(
+      join(cwd, '.pi', 'settings.json'),
+      JSON.stringify({ packages: [{ source: 'npm:pi-mcp-adapter', extensions: [] }] })
+    )
+    assert.equal(piMcpAdapterInstalled(cwd), false)
   } finally {
     if (prev === undefined) delete process.env.PI_CODING_AGENT_DIR
     else process.env.PI_CODING_AGENT_DIR = prev

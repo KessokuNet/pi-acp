@@ -58,7 +58,7 @@ import {
 } from './pi-acp-settings.js'
 import { toAvailableCommandsFromPiGetCommands } from './pi-commands.js'
 import { maybeAuthRequiredError } from './auth-required.js'
-import { writeMcpConfig, buildMcpNotice, cleanupStaleGeneratedConfig } from './mcp-config.js'
+import { writeMcpConfigForPi, buildMcpNotice, cleanupStaleGeneratedConfig, combinerEnvFor } from './mcp-config.js'
 import { isAbsolute } from 'node:path'
 import { existsSync, readFileSync, realpathSync, readdirSync, statSync, unlinkSync } from 'node:fs'
 import type { AvailableCommand } from '@agentclientprotocol/sdk'
@@ -219,7 +219,7 @@ export class PiAcpAgent implements ACPAgent {
       // MCP servers (session/load, session/resume). Plain restores (e.g. lazy restore on prompt)
       // carry no servers and generate nothing. Also clean up a stale generated `<cwd>/.pi/mcp.json`.
       cleanupStaleGeneratedConfig(cwd)
-      const mcpWrite = writeMcpConfig(opts?.mcpServers)
+      const mcpWrite = await writeMcpConfigForPi(cwd, opts?.mcpServers, getPiCommandOverride())
 
       let proc: PiRpcProcess
       try {
@@ -229,6 +229,7 @@ export class PiAcpAgent implements ACPAgent {
           piCommand: getPiCommandOverride(),
           additionalDirectories: opts?.additionalDirectories,
           mcpConfigPath: mcpWrite.handle?.path,
+          env: combinerEnvFor(opts?.mcpServers),
           rpcTimeoutMs: getRpcTimeoutMs()
         })
       } catch (e: any) {
@@ -332,13 +333,14 @@ export class PiAcpAgent implements ACPAgent {
     // (written before create() so it exists before pi starts). Also clean up any stale
     // `<cwd>/.pi/mcp.json` a previous pi-acp version generated, so it can't win at highest precedence.
     cleanupStaleGeneratedConfig(params.cwd)
-    const mcpWrite = writeMcpConfig(params.mcpServers)
+    const mcpWrite = await writeMcpConfigForPi(params.cwd, params.mcpServers, getPiCommandOverride())
     const mcpNotice = buildMcpNotice(params.cwd, mcpWrite)
 
     const session = await this.sessions.create({
       cwd: params.cwd,
       mcpServers: params.mcpServers,
       mcpConfigPath: mcpWrite.handle?.path,
+      env: combinerEnvFor(params.mcpServers),
       mcpConfigCleanup: mcpWrite.handle?.cleanup,
       conn: this.conn,
       fileCommands,
