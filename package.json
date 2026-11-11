@@ -9,15 +9,15 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/korewaChino/pi-acp.git"
+    "url": "git+https://github.com/KessokuNet/pi-acp.git"
   },
   "publishConfig": {
     "access": "public"
   },
   "bugs": {
-    "url": "https://github.com/korewaChino/pi-acp/issues"
+    "url": "https://github.com/KessokuNet/pi-acp/issues"
   },
-  "homepage": "https://github.com/korewaChino/pi-acp#readme",
+  "homepage": "https://github.com/KessokuNet/pi-acp#readme",
   "keywords": [
     "pi-package",
     "pi",
@@ -39,13 +39,14 @@
   "files": [
     "dist",
     "src/pi-extension.ts",
+    "src/auto-title.ts",
     "assets"
   ],
   "pi": {
     "extensions": [
       "./src/pi-extension.ts"
     ],
-    "image": "https://raw.githubusercontent.com/korewaChino/pi-acp/main/assets/preview.png"
+    "image": "https://raw.githubusercontent.com/KessokuNet/pi-acp/main/assets/preview.png"
   },
   "scripts": {
     "dev": "tsx src/index.ts",

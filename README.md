@@ -12,25 +12,22 @@ Expect some minor breaking changes.
 
 ## Differences from upstream
 
-This is a fork of [`svkozak/pi-acp`](https://github.com/svkozak/pi-acp), published to npm as
-**`@geohar/pi-acp`** (upstream is unscoped `pi-acp`).
+[KessokuNet/pi-acp](https://github.com/KessokuNet/pi-acp) is based on
+[georgeharker/pi-acp](https://github.com/georgeharker/pi-acp), itself a fork of
+[svkozak/pi-acp](https://github.com/svkozak/pi-acp). This fork has not been published to npm.
 
-**Why a fork.** It exists to carry capabilities upstream doesn't have — chiefly surfacing the
-[pi-subagents](https://github.com/tintinweb/pi-subagents) fleet as ACP tasks, auto-configuring MCP
-for pi, multi-root workspaces, and moving toward ACP v2 — and to iterate on them independently. It's
-an independent fork published under the `@geohar` scope so it can be installed and depended on
-directly; it does not track upstream on a schedule, and there's no commitment to contribute these
-changes back (they may or may not be upstreamed later). If you want the original, use
-[`svkozak/pi-acp`](https://github.com/svkozak/pi-acp).
+It uses ACP SDK 2.6.0 over protocol v1 and adds Zed subagent cards, pi-tasks plans,
+compaction cards, retry notices, automatic session titles, native rename support,
+model-specific reasoning levels, and readable composer references.
+MCP forwarding uses Pi's built-in support rather than a separate MCP extension.
 
 On top of upstream it adds:
 
 - **Subagents as ACP tasks** — a bundled pi extension bridges the
   [pi-subagents](https://github.com/tintinweb/pi-subagents) fleet into the ACP `plan` channel, so
   each subagent shows up as a task. See [Subagents as tasks](#subagents-as-tasks).
-- **MCP auto-configuration** — ACP `mcpServers` are translated into a generated `<cwd>/.pi/mcp.json`
-  for [pi-mcp-adapter](https://github.com/nicobailon/pi-mcp-adapter) to load. See
-  [MCP servers](#mcp-servers).
+- **MCP forwarding** — ACP `mcpServers` are registered with pi's built-in MCP support for the
+  session. See [MCP servers](#mcp-servers).
 - **Multi-root workspaces** — additional workspace roots on `session/new` / `session/load`
   (`sessionCapabilities.additionalDirectories`), communicated to pi via `--append-system-prompt`.
 - **v2-oriented session capabilities** — advertises `session/resume`, `session/close`, and
@@ -261,32 +258,22 @@ Project layout:
 
 ## MCP servers
 
-MCP servers passed by the ACP client (`session/new`, `session/load`, `session/resume`) are translated
-into a **session-scoped temp file** and handed to [pi-mcp-adapter](https://github.com/nicobailon/pi-mcp-adapter)
-via `pi --mode rpc --mcp-config <tempfile>`. stdio and http servers are supported; sse/acp servers
-cannot be expressed and are skipped with a notice. The temp file is removed when the session closes.
-Install `pi-mcp-adapter` in your pi `packages` for the servers to actually load — the adapter emits a
-startup notice when it is missing.
+MCP servers passed by the ACP client (`session/new`, `session/load`, `session/resume`) are handed to
+the spawned pi in the `PI_ACP_MCP_SERVERS` environment variable. The bundled pi extension registers
+each one with `pi.registerMcpServer()`, so pi's built-in MCP support connects them for that session
+only. No extra MCP extension is needed, and nothing is written to disk.
 
-The temp file may hold secrets the client sent literally (an `Authorization` header value, or stdio
-`env` values), so it is written in an owner-only (`0700`) temp dir with `0600` permissions. To keep a
-bearer token off disk entirely, express it as `$env:VAR` (via the policy's `auth.bearerTokenEnv`, or a
-`$env:`-valued header from the client) — pi-mcp-adapter resolves `$env:` at connect, so only the
-placeholder is written.
+stdio and http servers are supported; sse/acp servers are skipped with a notice. A server with the
+same name in your own `mcp.json` takes precedence over the client's. The pi-acp package must be
+installed as a pi package (`pi install <path or npm:...>`) for the extension to load.
 
-pi-acp deliberately **does not** write `<cwd>/.pi/mcp.json`. That path is pi's own highest-precedence
-project config namespace (settings, prompts, trust, mcp): writing there overrode the user's global
-MCP config, persisted past the session, and leaked into unrelated (even non-ACP) pi sessions launched
-from the same directory. `--mcp-config` overrides only pi-mcp-adapter's `pi-global` source, never pi's
-config dir, so all of pi's own MCP config (global and project) still flows through. A stale
-`<cwd>/.pi/mcp.json` left by an older pi-acp version (marked `_generatedBy: pi-acp`) is cleaned up
-automatically.
+A stale `<cwd>/.pi/mcp.json` left by an older pi-acp version (marked `_generatedBy: pi-acp`) is
+cleaned up automatically.
 
-### MCP generation policy
+### MCP policy
 
-By default pi-acp generates every ACP-provided server into the temp overlay (additive — it never
-overrides your own config). To control which servers it generates — same semantics pi uses for
-subagent tool/extension inheritance — create `~/.pi/pi-acp/mcp-policy.json` (under `PI_ACP_DATA_DIR`):
+By default pi-acp registers every client-provided server. To control which servers it registers,
+create `~/.pi/pi-acp/mcp-policy.json` (under `PI_ACP_DATA_DIR`):
 
 ```json
 {
@@ -298,12 +285,11 @@ subagent tool/extension inheritance — create `~/.pi/pi-acp/mcp-policy.json` (u
 }
 ```
 
-- **`generate`** — which servers pi-acp may write: `true`/`"*"`/omitted = all (default) · `["a","b"]` =
-  only those · `false` = none. Servers not generated are left to your own (lower-precedence) config.
-- **`exclude`** — denylist (wins over `generate`): never generate these. Use it for a server you
-  configure globally with its own auth (e.g. a bearer-auth'd combiner) so pi-acp doesn't override it.
-- **`auth`** — for a server pi-acp _does_ generate, write `Authorization: Bearer $env:<VAR>` (+ extra
-  headers). pi-mcp-adapter interpolates `$env:` at connect, so the token is never written to disk.
+- **`generate`** — which servers pi-acp registers: `true`/`"*"`/omitted = all (default) · `["a","b"]` =
+  only those · `false` = none.
+- **`exclude`** — denylist (wins over `generate`).
+- **`auth`** — for a registered server, add `Authorization: Bearer ${VAR}` (+ extra headers). pi
+  expands `${VAR}` when it connects.
 
 Names are case-insensitive. Note the ACP MCP shape has no dedicated auth field, so bearer auth can
 only travel as an HTTP header — either provided by the client in the server's `headers`, or added via

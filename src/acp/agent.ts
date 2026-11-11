@@ -17,6 +17,8 @@ import {
   type SetSessionConfigOptionResponse,
   type SetSessionModeRequest,
   type SetSessionModeResponse,
+  type SetSessionTitleRequest,
+  type SetSessionTitleResponse,
   type StopReason,
   type DeleteSessionRequest,
   type DeleteSessionResponse,
@@ -57,7 +59,7 @@ import {
 } from './pi-acp-settings.js'
 import { toAvailableCommandsFromPiGetCommands } from './pi-commands.js'
 import { maybeAuthRequiredError } from './auth-required.js'
-import { writeMcpConfigForPi, buildMcpNotice, cleanupStaleGeneratedConfig, combinerEnvFor } from './mcp-config.js'
+import { buildMcpNotice, cleanupStaleGeneratedConfig, mcpForwardingFor } from './mcp-config.js'
 import { isAbsolute } from 'node:path'
 import { existsSync, readFileSync, realpathSync, readdirSync, statSync, unlinkSync } from 'node:fs'
 import type { AvailableCommand } from '@agentclientprotocol/sdk/unstable'
@@ -65,7 +67,6 @@ import { join, dirname, basename } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { normalizeAdditionalDirectories } from './workspace-roots.js'
 
-type ThinkingLevel = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh'
 type AdvertisedModel = {
   modelId: string
   name: string
@@ -214,11 +215,9 @@ export class PiAcpAgent {
 
       const cwd = opts?.cwd ?? stored.cwd
 
-      // Write a session-scoped temp MCP config (passed via `--mcp-config`) when the client supplied
-      // MCP servers (session/load, session/resume). Plain restores (e.g. lazy restore on prompt)
-      // carry no servers and generate nothing. Also clean up a stale generated `<cwd>/.pi/mcp.json`.
+      // Plain restores (e.g. lazy restore on prompt) carry no client MCP servers.
       cleanupStaleGeneratedConfig(cwd)
-      const mcpWrite = await writeMcpConfigForPi(cwd, opts?.mcpServers, getPiCommandOverride())
+      const mcp = mcpForwardingFor(opts?.mcpServers)
 
       let proc: PiRpcProcess
       try {
@@ -227,8 +226,7 @@ export class PiAcpAgent {
           sessionPath: stored.sessionFile,
           piCommand: getPiCommandOverride(),
           additionalDirectories: opts?.additionalDirectories,
-          mcpConfigPath: mcpWrite.handle?.path,
-          env: combinerEnvFor(opts?.mcpServers),
+          env: mcp.env,
           rpcTimeoutMs: getRpcTimeoutMs()
         })
       } catch (e: any) {
@@ -246,7 +244,6 @@ export class PiAcpAgent {
         proc,
         fileCommands,
         additionalDirectories: opts?.additionalDirectories,
-        mcpConfigCleanup: mcpWrite.handle?.cleanup,
         clientCapabilities: this.clientCapabilities
       })
 
@@ -290,8 +287,7 @@ export class PiAcpAgent {
       }),
       agentCapabilities: {
         loadSession: true,
-        // stdio is the baseline (no flag); http servers are translated into pi-mcp-adapter
-        // config. sse/acp cannot be expressed in that config shape.
+        // pi's built-in MCP speaks stdio and streamable HTTP, not legacy SSE.
         mcpCapabilities: { http: true, sse: false },
         promptCapabilities: {
           image: true,
@@ -305,7 +301,8 @@ export class PiAcpAgent {
           delete: {},
           additionalDirectories: {},
           resume: {},
-          close: {}
+          close: {},
+          title: {}
         }
       }
     }
@@ -328,19 +325,15 @@ export class PiAcpAgent {
     const fileCommands = loadSlashCommands(params.cwd)
     const enableSkillCommands = getEnableSkillCommands(params.cwd)
 
-    // Translate ACP mcpServers into a session-scoped temp MCP config passed to pi via `--mcp-config`
-    // (written before create() so it exists before pi starts). Also clean up any stale
-    // `<cwd>/.pi/mcp.json` a previous pi-acp version generated, so it can't win at highest precedence.
+    // The bundled pi extension registers these with pi's built-in MCP support.
     cleanupStaleGeneratedConfig(params.cwd)
-    const mcpWrite = await writeMcpConfigForPi(params.cwd, params.mcpServers, getPiCommandOverride())
-    const mcpNotice = buildMcpNotice(params.cwd, mcpWrite)
+    const mcp = mcpForwardingFor(params.mcpServers)
+    const mcpNotice = buildMcpNotice(mcp)
 
     const session = await this.sessions.create({
       cwd: params.cwd,
       mcpServers: params.mcpServers,
-      mcpConfigPath: mcpWrite.handle?.path,
-      env: combinerEnvFor(params.mcpServers),
-      mcpConfigCleanup: mcpWrite.handle?.cleanup,
+      env: mcp.env,
       conn: this.conn,
       fileCommands,
       piCommand: getPiCommandOverride(),
@@ -507,7 +500,7 @@ export class PiAcpAgent {
   async prompt(params: PromptRequest): Promise<PromptResponse> {
     const session = await this.restoreSession(params.sessionId)
 
-    const { message, images } = promptToPiMessage(params.prompt)
+    const { message, images } = promptToPiMessage(params.prompt, session.cwd)
 
     // Built-in ACP slash command handling (headless-friendly subset).
     // Note: file-based slash commands are expanded inside session.prompt().
@@ -1328,11 +1321,21 @@ export class PiAcpAgent {
     void session.publishContextUsage()
   }
 
+  async setSessionTitle(params: SetSessionTitleRequest): Promise<SetSessionTitleResponse> {
+    if (typeof params.title !== 'string' || !params.title.trim()) {
+      throw RequestError.invalidParams('Session title must not be empty')
+    }
+    const title = params.title.trim()
+    const session = await this.restoreSession(params.sessionId)
+    await session.proc.setSessionName(title)
+    return { title }
+  }
+
   async setSessionMode(params: SetSessionModeRequest): Promise<SetSessionModeResponse> {
     const session = await this.restoreSession(params.sessionId)
 
     const mode = String(params.modeId)
-    if (!isThinkingLevel(mode)) {
+    if (!(await getThinkingState(session.proc)).availableModes.some(option => option.id === mode)) {
       throw RequestError.invalidParams(`Unknown modeId: ${mode}`)
     }
 
@@ -1364,7 +1367,7 @@ export class PiAcpAgent {
       await setSessionModel(session.proc, params.value)
       this.publishContextUsage(session)
     } else if (configId === THOUGHT_LEVEL_CONFIG_ID) {
-      if (!isThinkingLevel(params.value)) {
+      if (!(await getThinkingState(session.proc)).availableModes.some(option => option.id === params.value)) {
         throw RequestError.invalidParams(`Unknown thinking level: ${params.value}`)
       }
 
@@ -1386,10 +1389,6 @@ export class PiAcpAgent {
   }
 }
 
-function isThinkingLevel(x: string): x is ThinkingLevel {
-  return x === 'off' || x === 'minimal' || x === 'low' || x === 'medium' || x === 'high' || x === 'xhigh'
-}
-
 async function getThinkingState(
   proc: PiRpcProcess,
   pre?: { state?: any | null }
@@ -1402,7 +1401,7 @@ async function getThinkingState(
   currentModeId: string
 }> {
   // Ask pi for current thinking level.
-  let current: ThinkingLevel = 'medium'
+  let current = 'off'
 
   const state =
     pre?.state ??
@@ -1415,9 +1414,18 @@ async function getThinkingState(
     })())
 
   const tl = typeof state?.thinkingLevel === 'string' ? state.thinkingLevel : null
-  if (tl && isThinkingLevel(tl)) current = tl
+  if (tl) current = tl
 
-  const available: ThinkingLevel[] = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh']
+  let available = [current]
+  try {
+    const result = await proc.getAvailableThinkingLevels()
+    if (result !== null && typeof result === 'object' && 'levels' in result && Array.isArray(result.levels)) {
+      const levels = result.levels.filter((level): level is string => typeof level === 'string' && level.length > 0)
+      if (levels.length) available = [...new Set(levels)]
+    }
+  } catch {
+    // Older Pi versions can only confirm their current level.
+  }
 
   return {
     currentModeId: current,

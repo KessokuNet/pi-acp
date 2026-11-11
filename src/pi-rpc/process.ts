@@ -38,7 +38,8 @@ type PiRpcCommand =
   | { type: 'get_available_models'; id?: string }
   | { type: 'set_model'; id?: string; provider: string; modelId: string }
   // Thinking
-  | { type: 'set_thinking_level'; id?: string; level: 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' }
+  | { type: 'get_available_thinking_levels'; id?: string }
+  | { type: 'set_thinking_level'; id?: string; level: string }
   // Modes
   | { type: 'set_follow_up_mode'; id?: string; mode: 'all' | 'one-at-a-time' }
   | { type: 'set_steering_mode'; id?: string; mode: 'all' | 'one-at-a-time' }
@@ -82,13 +83,7 @@ type SpawnParams = {
    * `--append-system-prompt` since pi has no native multi-root workspace support.
    */
   additionalDirectories?: readonly string[]
-  /**
-   * Path to a generated MCP config passed to pi-mcp-adapter via `--mcp-config`, which the adapter
-   * reads as its pi-global config source — so we never write into pi's own `<cwd>/.pi/` config
-   * namespace. Only set when the adapter is installed: see the spawn note below.
-   */
-  mcpConfigPath?: string
-  /** Extra environment for the pi child (e.g. the client's combiner session URL). */
+  /** Extra environment for the pi child (e.g. the client's MCP servers and combiner URL). */
   env?: Record<string, string>
   /** Per-request RPC timeout (ms). Falls back to {@link DEFAULT_RPC_TIMEOUT_MS} when unset. */
   rpcTimeoutMs?: number
@@ -214,10 +209,6 @@ export class PiRpcProcess {
     // (e.g. MCP extensions, prompt templates for workflows).
     const args = ['--mode', 'rpc', '--no-themes']
     if (params.sessionPath) args.push('--session', params.sessionPath)
-    // `--mcp-config` is pi-mcp-adapter's registered flag. pi matches leftover `--` flags against the
-    // flags of loaded extensions and exits (all modes) on any unmatched one, so callers must only
-    // pass this when the adapter is installed (writeMcpConfigForPi).
-    if (params.mcpConfigPath) args.push('--mcp-config', params.mcpConfigPath)
 
     // Workspace roots go through `--append-system-prompt`, which pi resolves from a
     // file when the argument is an existing path. Using a temp file (instead of inline
@@ -374,7 +365,14 @@ export class PiRpcProcess {
     return res.data
   }
 
-  async setThinkingLevel(level: 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh'): Promise<void> {
+  async getAvailableThinkingLevels(): Promise<unknown> {
+    const res = await this.request({ type: 'get_available_thinking_levels' })
+    if (!res.success)
+      throw new Error(`pi get_available_thinking_levels failed: ${res.error ?? JSON.stringify(res.data)}`)
+    return res.data
+  }
+
+  async setThinkingLevel(level: string): Promise<void> {
     const res = await this.request({ type: 'set_thinking_level', level })
     if (!res.success) throw new Error(`pi set_thinking_level failed: ${res.error ?? JSON.stringify(res.data)}`)
   }

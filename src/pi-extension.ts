@@ -22,8 +22,11 @@
  * (it drives pi over RPC). pi injects the real API at load time.
  */
 
+import { installAutoTitle } from './auto-title.js'
+
 const CUSTOM_TYPE = 'acp:subagents'
 const PLAN_CUSTOM_TYPE = 'acp:plan'
+const MCP_SERVERS_ENV = 'PI_ACP_MCP_SERVERS'
 
 type BusHandler = (data: unknown) => void
 type HookHandler = (event: unknown, ctx: unknown) => void
@@ -32,6 +35,9 @@ interface PiExtensionApi {
   on(event: string, handler: HookHandler): void
   events: { on(channel: string, handler: BusHandler): () => void }
   appendEntry(customType: string, data?: unknown): string
+  registerMcpServer?(name: string, config: Record<string, unknown>): void
+  getSessionName?(): string | undefined
+  setSessionName?(name: string): void
 }
 
 type Agent = { id: string; type?: string; description?: string; status: string }
@@ -41,7 +47,35 @@ function str(v: unknown): string | undefined {
   return typeof v === 'string' ? v : undefined
 }
 
+/**
+ * Registers the ACP client's MCP servers, which the adapter passes in `PI_ACP_MCP_SERVERS`, with pi's
+ * built-in MCP support. Servers registered during load connect when the session starts, and a
+ * same-named server in the user's `mcp.json` takes precedence.
+ */
+function registerClientMcpServers(pi: PiExtensionApi): void {
+  const raw = process.env[MCP_SERVERS_ENV]
+  if (!raw || typeof pi.registerMcpServer !== 'function') return
+  let servers: unknown
+  try {
+    servers = JSON.parse(raw)
+  } catch {
+    return
+  }
+  if (!servers || typeof servers !== 'object') return
+  for (const [name, config] of Object.entries(servers as Record<string, unknown>)) {
+    if (!config || typeof config !== 'object') continue
+    try {
+      pi.registerMcpServer(name, config as Record<string, unknown>)
+    } catch (error) {
+      process.stderr.write(`pi-acp: could not register MCP server "${name}": ${String(error)}\n`)
+    }
+  }
+}
+
 export default function (pi: PiExtensionApi): void {
+  registerClientMcpServers(pi)
+  installAutoTitle(pi)
+
   // Bridge only when driven headless over RPC (an ACP adapter), not in the interactive TUI, where
   // these entries would be pointless clutter. `mode` is read from the session_start context (the
   // extension's own load runs before mode is set). `PI_ACP=1` remains an explicit override.

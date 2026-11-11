@@ -1,3 +1,32 @@
+import type { ToolKind } from '@agentclientprotocol/sdk/unstable'
+
+export function toToolKind(toolName: string): ToolKind {
+  switch (toolName) {
+    case 'read':
+    case 'ls':
+    case 'list':
+      return 'read'
+    case 'write':
+    case 'edit':
+    case 'patch':
+      return 'edit'
+    case 'bash':
+      return 'execute'
+    case 'grep':
+    case 'find':
+    case 'search':
+      return 'search'
+    case 'web_fetch':
+    case 'webfetch':
+    case 'fetch':
+      return 'fetch'
+    case 'think':
+      return 'think'
+    default:
+      return 'other'
+  }
+}
+
 export function toolResultToText(result: unknown): string {
   if (!result) return ''
 

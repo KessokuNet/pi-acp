@@ -41,6 +41,9 @@ test('PiAcpAgent: newSession returns configOptions for model and thinking select
             ]
           }
         },
+        async getAvailableThinkingLevels() {
+          return { levels: ['off', 'minimal', 'low', 'medium', 'high', 'xhigh'] }
+        },
         async getState() {
           return {
             thinkingLevel: 'high',
@@ -165,6 +168,9 @@ test('PiAcpAgent: setSessionConfigOption maps thought level changes to pi and em
       },
       async getState() {
         return state
+      },
+      async getAvailableThinkingLevels() {
+        return { levels: ['off', 'medium', 'xhigh'] }
       },
       async setThinkingLevel(level: string) {
         thinkingLevels.push(level)

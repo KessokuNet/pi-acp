@@ -1,6 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { PiAcpSession, toToolKind, toUsageUpdate } from '../../src/acp/session.js'
+import { PiAcpSession, toUsageUpdate } from '../../src/acp/session.js'
+import { toToolKind } from '../../src/acp/translate/pi-tools.js'
 import { FakeAgentSideConnection, FakePiRpcProcess, asAgentConn } from '../helpers/fakes.js'
 
 test('toUsageUpdate: maps contextUsage to used/size', () => {

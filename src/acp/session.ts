@@ -5,11 +5,11 @@ import type {
   PermissionOption,
   SessionUpdate,
   ToolCallContent,
-  ToolCallLocation,
-  ToolKind
+  ToolCallLocation
 } from '@agentclientprotocol/sdk/unstable'
 import { RequestError } from '@agentclientprotocol/sdk/unstable'
 import type { AcpClientConnection } from './connection.js'
+import { AGENT_TOOL_NAME, SubagentSessions } from './subagent-sessions.js'
 import { readFileSync } from 'node:fs'
 import { isAbsolute, resolve as resolvePath } from 'node:path'
 import { PiRpcProcess, PiRpcSpawnError, type PiRpcEvent } from '../pi-rpc/process.js'
@@ -27,7 +27,7 @@ import {
   bashTerminalOutputMeta,
   isBashTool
 } from './translate/bash.js'
-import { toolResultToText } from './translate/pi-tools.js'
+import { toToolKind, toolResultToText } from './translate/pi-tools.js'
 import { getPiAcpDebug } from './pi-acp-settings.js'
 import {
   SUBAGENT_PLAN_CUSTOM_TYPE,
@@ -61,12 +61,8 @@ type SessionCreateParams = {
   piCommand?: string
   /** ACP additionalDirectories: extra workspace roots beyond cwd (absolute paths). */
   additionalDirectories?: string[]
-  /** Path to the generated MCP config temp file, passed to pi via `--mcp-config`. */
-  mcpConfigPath?: string
-  /** Extra environment for the pi child (see `combinerEnvFor`). */
+  /** Extra environment for the pi child (see `mcpForwardingFor`). */
   env?: Record<string, string>
-  /** Cleanup for the generated MCP config temp file, invoked when the session is closed. */
-  mcpConfigCleanup?: () => void
   /** Full ACP client capabilities from initialize, used to gate wire features (terminals, plan, fs). */
   clientCapabilities?: ClientCapabilities
   /** Per-request pi RPC timeout (ms); falls back to the process default when unset. */
@@ -222,13 +218,9 @@ export class SessionManager {
   close(sessionId: string): void {
     const s = this.sessions.get(sessionId)
     if (!s) return
+    s.dispose?.()
     try {
       s.proc.dispose?.()
-    } catch {
-      // ignore
-    }
-    try {
-      s.mcpConfigCleanup?.()
     } catch {
       // ignore
     }
@@ -262,7 +254,6 @@ export class SessionManager {
         cwd: params.cwd,
         piCommand: params.piCommand,
         additionalDirectories: params.additionalDirectories,
-        mcpConfigPath: params.mcpConfigPath,
         env: params.env,
         rpcTimeoutMs: params.rpcTimeoutMs
       })
@@ -295,7 +286,6 @@ export class SessionManager {
       conn: params.conn,
       fileCommands: params.fileCommands ?? [],
       additionalDirectories: params.additionalDirectories ?? [],
-      mcpConfigCleanup: params.mcpConfigCleanup,
       clientCapabilities: params.clientCapabilities
     })
 
@@ -325,7 +315,6 @@ export class SessionManager {
       conn: params.conn,
       fileCommands: params.fileCommands ?? [],
       additionalDirectories: params.additionalDirectories ?? [],
-      mcpConfigCleanup: params.mcpConfigCleanup,
       clientCapabilities: params.clientCapabilities
     })
 
@@ -339,7 +328,6 @@ export class PiAcpSession {
   readonly cwd: string
   readonly mcpServers: McpServer[]
   readonly additionalDirectories: string[]
-  readonly mcpConfigCleanup?: () => void
   private readonly clientCapabilities?: ClientCapabilities
 
   private startupInfo: string | null = null
@@ -374,6 +362,7 @@ export class PiAcpSession {
   private bashOutputSnapshots = new Map<string, string>()
   private taskPlan: TaskPlanState = newTaskPlanState()
   private compactionId: string | undefined
+  private readonly subagents: SubagentSessions
   private taskToolArgs = new Map<string, { toolName: string; args: unknown }>()
 
   // Ensure `session/update` notifications are sent in order and can be awaited
@@ -388,18 +377,22 @@ export class PiAcpSession {
     conn: AcpClientConnection
     fileCommands?: FileSlashCommand[]
     additionalDirectories?: string[]
-    mcpConfigCleanup?: () => void
     clientCapabilities?: ClientCapabilities
   }) {
     this.sessionId = opts.sessionId
     this.cwd = opts.cwd
     this.mcpServers = opts.mcpServers
     this.additionalDirectories = opts.additionalDirectories ?? []
-    this.mcpConfigCleanup = opts.mcpConfigCleanup
     this.proc = opts.proc
     this.conn = opts.conn
     this.fileCommands = opts.fileCommands ?? []
     this.clientCapabilities = opts.clientCapabilities
+    this.subagents = new SubagentSessions({
+      parentSessionId: this.sessionId,
+      cwd: this.cwd,
+      supportsSubagents: this.clientSupportsSubagents(),
+      emit: (sessionId, update) => this.emitFor(sessionId, update)
+    })
 
     this.proc.onEvent(ev => this.handlePiEvent(ev))
     this.proc.onExit(() => this.handleProcExit())
@@ -507,14 +500,13 @@ export class PiAcpSession {
   }
 
   private emit(update: SessionUpdate): void {
-    // Serialize update delivery.
+    this.emitFor(this.sessionId, update)
+  }
+
+  /** Serializes delivery for this session and its subagent children, so announcements precede child traffic. */
+  private emitFor(sessionId: string, update: SessionUpdate): void {
     this.lastEmit = this.lastEmit
-      .then(() =>
-        this.conn.sessionUpdate({
-          sessionId: this.sessionId,
-          update
-        })
-      )
+      .then(() => this.conn.sessionUpdate({ sessionId, update }))
       .catch(() => {
         // Ignore notification errors (client may have gone away). We still want
         // prompt completion.
@@ -780,6 +772,7 @@ export class PiAcpSession {
         if ((TASK_TOOL_NAMES as readonly string[]).includes(toolName)) {
           this.taskToolArgs.set(toolCallId, { toolName, args })
         }
+        if (toolName === AGENT_TOOL_NAME) this.subagents.onAgentToolStart(toolCallId, args)
 
         if (isBashTool(toolName)) {
           const locations = toToolCallLocations(args, this.cwd)
@@ -892,6 +885,10 @@ export class PiAcpSession {
           }
         }
 
+        if (String((ev as { toolName?: unknown }).toolName) === AGENT_TOOL_NAME) {
+          this.subagents.onAgentToolEnd(toolCallId, result)
+        }
+
         if (this.bashToolCallIds.has(toolCallId)) {
           this.emitBashOutputUpdate({
             toolCallId,
@@ -991,6 +988,18 @@ export class PiAcpSession {
 
       case 'compaction_end': {
         this.handleCompactionEnd(ev)
+        break
+      }
+
+      case 'session_info_changed': {
+        const name = ev.name
+        if (typeof name === 'string' || name === undefined) {
+          this.emit({
+            sessionUpdate: 'session_info_update',
+            title: name ?? null,
+            updatedAt: new Date().toISOString()
+          })
+        }
         break
       }
 
@@ -1109,14 +1118,18 @@ export class PiAcpSession {
         this.subagentFleet.clear()
       } else {
         // mergeSubagent is monotonic + field-preserving (pi can emit `started` before `created`).
-        this.subagentFleet.set(parsed.agent.id, mergeSubagent(this.subagentFleet.get(parsed.agent.id), parsed.agent))
+        const merged = mergeSubagent(this.subagentFleet.get(parsed.agent.id), parsed.agent)
+        this.subagentFleet.set(parsed.agent.id, merged)
+        this.subagents.onAgent(merged)
       }
       changed = true
     } else if (e.customType === SUBAGENT_RECORD_CUSTOM_TYPE) {
       const rec = parseSubagentRecord(e.data)
       if (!rec) return
       // Final record enriches the existing live entry (same monotonic + field-preserving merge).
-      this.subagentFleet.set(rec.id, mergeSubagent(this.subagentFleet.get(rec.id), rec))
+      const merged = mergeSubagent(this.subagentFleet.get(rec.id), rec)
+      this.subagentFleet.set(rec.id, merged)
+      this.subagents.onAgent(merged)
       changed = true
     } else if (e.customType === PLAN_CUSTOM_TYPE) {
       const op = parsePlanEntry(e.data)
@@ -1124,7 +1137,9 @@ export class PiAcpSession {
       changed = applyPlanEntry(this.planState, op)
     }
 
-    if (changed) {
+    // The fleet is out of the plan for subagent-capable clients, so its changes leave the plan as is.
+    const fleetOnly = e.customType === SUBAGENT_PLAN_CUSTOM_TYPE || e.customType === SUBAGENT_RECORD_CUSTOM_TYPE
+    if (changed && !(fleetOnly && this.clientSupportsSubagents())) {
       if (getPiAcpDebug()) {
         const fleet = Array.from(this.subagentFleet.values(), a => `${a.id.slice(0, 8)}=${a.status ?? '?'}`).join(', ')
         const planCount = toCribPlanEntries(this.planState).length
@@ -1135,15 +1150,24 @@ export class PiAcpSession {
   }
 
   // One ACP plan surfaces every source: cribsheet plan, pi-tasks list, then the subagent fleet.
+  // Clients with native subagent cards already show the fleet, so it stays out of their plan.
   private emitPlan(): void {
     this.emit({
       sessionUpdate: 'plan',
       entries: [
         ...toCribPlanEntries(this.planState),
         ...toTaskPlanEntries(this.taskPlan),
-        ...toPlanEntries(this.subagentFleet.values())
+        ...(this.clientSupportsSubagents() ? [] : toPlanEntries(this.subagentFleet.values()))
       ]
     })
+  }
+
+  private clientSupportsSubagents(): boolean {
+    return this.clientCapabilities?.subagents != null
+  }
+
+  dispose(): void {
+    this.subagents.dispose()
   }
 
   private clientSupportsNotices(): boolean {
@@ -1313,31 +1337,4 @@ function formatAutoRetryMessage(ev: PiRpcEvent): string {
   if (delayMs > 0 && delaySeconds === 0) delaySeconds = 1
 
   return `Retrying (attempt ${attempt}/${maxAttempts}, waiting ${delaySeconds}s)...`
-}
-
-export function toToolKind(toolName: string): ToolKind {
-  switch (toolName) {
-    case 'read':
-    case 'ls':
-    case 'list':
-      return 'read'
-    case 'write':
-    case 'edit':
-    case 'patch':
-      return 'edit'
-    case 'bash':
-      return 'execute'
-    case 'grep':
-    case 'find':
-    case 'search':
-      return 'search'
-    case 'web_fetch':
-    case 'webfetch':
-    case 'fetch':
-      return 'fetch'
-    case 'think':
-      return 'think'
-    default:
-      return 'other'
-  }
 }
