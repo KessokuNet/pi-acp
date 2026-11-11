@@ -1,0 +1,87 @@
+import test from 'node:test'
+import assert from 'node:assert/strict'
+import { PiAcpSession, toToolKind, toUsageUpdate } from '../../src/acp/session.js'
+import { FakeAgentSideConnection, FakePiRpcProcess, asAgentConn } from '../helpers/fakes.js'
+
+test('toUsageUpdate: maps contextUsage to used/size', () => {
+  assert.deepEqual(toUsageUpdate({ contextUsage: { tokens: 1234, contextWindow: 200000 } }), {
+    sessionUpdate: 'usage_update',
+    used: 1234,
+    size: 200000
+  })
+})
+
+test('toUsageUpdate: rejects missing or unusable counts', () => {
+  const cases: unknown[] = [
+    undefined,
+    null,
+    {},
+    { contextUsage: null },
+    { contextUsage: { tokens: null, contextWindow: 200000 } },
+    { contextUsage: { tokens: 10, contextWindow: 0 } },
+    { contextUsage: { tokens: 10, contextWindow: -1 } },
+    { contextUsage: { tokens: -1, contextWindow: 100 } },
+    { contextUsage: { tokens: 1.5, contextWindow: 100 } },
+    { contextUsage: { tokens: '10', contextWindow: 100 } }
+  ]
+
+  for (const stats of cases) {
+    assert.equal(toUsageUpdate(stats), null, `expected null for ${JSON.stringify(stats)}`)
+  }
+})
+
+test('toToolKind: maps pi tool names to ACP tool kinds', () => {
+  assert.equal(toToolKind('read'), 'read')
+  assert.equal(toToolKind('ls'), 'read')
+  assert.equal(toToolKind('write'), 'edit')
+  assert.equal(toToolKind('edit'), 'edit')
+  assert.equal(toToolKind('bash'), 'execute')
+  assert.equal(toToolKind('grep'), 'search')
+  assert.equal(toToolKind('find'), 'search')
+  assert.equal(toToolKind('web_fetch'), 'fetch')
+  assert.equal(toToolKind('mcp__server__tool'), 'other')
+})
+
+test('PiAcpSession: publishes usage_update when a turn settles', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  proc.sessionStats = { contextUsage: { tokens: 500, contextWindow: 1000 } }
+
+  const session = new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  const turn = session.prompt('hello')
+  proc.emit({ type: 'agent_start' })
+  proc.emit({ type: 'agent_settled' })
+  await turn
+
+  const usage = conn.updates.filter(u => u.update.sessionUpdate === 'usage_update')
+  assert.equal(usage.length, 1)
+  assert.deepEqual(usage[0]!.update, { sessionUpdate: 'usage_update', used: 500, size: 1000 })
+})
+
+test('PiAcpSession: skips usage_update when pi reports no usable count', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  const session = new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  const turn = session.prompt('hello')
+  proc.emit({ type: 'agent_settled' })
+  await turn
+
+  assert.equal(conn.updates.filter(u => u.update.sessionUpdate === 'usage_update').length, 0)
+})

@@ -45,6 +45,13 @@ import {
   parsePlanEntry,
   toPlanEntries as toCribPlanEntries
 } from './plan-bridge.js'
+import {
+  TASK_TOOL_NAMES,
+  applyTaskToolResult,
+  newTaskPlanState,
+  toTaskPlanEntries,
+  type TaskPlanState
+} from './task-plan.js'
 
 type SessionCreateParams = {
   cwd: string
@@ -88,6 +95,23 @@ const CONFIRM_PERMISSION_OPTIONS: PermissionOption[] = [
 ]
 const EXTENSION_UI_RAW_INPUT_KEYS = ['title', 'message', 'options', 'placeholder', 'prefill'] as const
 const CHOICE_OPTION_PREFIX = 'choice-'
+const SESSION_STATS_TIMEOUT_MS = 5_000
+
+/**
+ * Map pi's `stats.contextUsage` to an ACP `usage_update`. Returns null when pi reports no
+ * trustworthy token count (e.g. right after compaction) so the client keeps its previous value.
+ */
+export function toUsageUpdate(stats: unknown): SessionUpdate | null {
+  const usage = (stats as { contextUsage?: { tokens?: unknown; contextWindow?: unknown } } | null | undefined)
+    ?.contextUsage
+  const used = usage?.tokens
+  const size = usage?.contextWindow
+
+  if (typeof used !== 'number' || !Number.isSafeInteger(used) || used < 0) return null
+  if (typeof size !== 'number' || !Number.isSafeInteger(size) || size <= 0) return null
+
+  return { sessionUpdate: 'usage_update', used, size }
+}
 
 function findUniqueLineNumber(text: string, needle: string): number | undefined {
   if (!needle) return undefined
@@ -348,6 +372,8 @@ export class PiAcpSession {
   private fileMutationToolCallIds = new Set<string>()
   private bashToolCallIds = new Set<string>()
   private bashOutputSnapshots = new Map<string, string>()
+  private taskPlan: TaskPlanState = newTaskPlanState()
+  private taskToolArgs = new Map<string, { toolName: string; args: unknown }>()
 
   // Ensure `session/update` notifications are sent in order and can be awaited
   // before completing a `session/prompt` request.
@@ -496,6 +522,24 @@ export class PiAcpSession {
 
   private async flushEmits(): Promise<void> {
     await this.lastEmit
+  }
+
+  /** Publish pi's context-window occupancy as `usage_update`. Never fails or delays a turn. */
+  async publishContextUsage(): Promise<void> {
+    try {
+      let timer: ReturnType<typeof setTimeout> | undefined
+      const timeout = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error('get_session_stats timeout')), SESSION_STATS_TIMEOUT_MS)
+      })
+      void timeout.catch(() => {})
+      const stats = await Promise.race([this.proc.getSessionStats(), timeout]).finally(() => clearTimeout(timer))
+      const update = toUsageUpdate(stats)
+      if (update) this.emit(update)
+    } catch {
+      // Usage is auxiliary.
+    }
+
+    await this.flushEmits()
   }
 
   /**
@@ -732,6 +776,10 @@ export class PiAcpSession {
         const args = (ev as any).args
         let line: number | undefined
 
+        if ((TASK_TOOL_NAMES as readonly string[]).includes(toolName)) {
+          this.taskToolArgs.set(toolCallId, { toolName, args })
+        }
+
         if (isBashTool(toolName)) {
           const locations = toToolCallLocations(args, this.cwd)
           const existingStatus = this.currentToolCalls.get(toolCallId)
@@ -831,6 +879,18 @@ export class PiAcpSession {
 
         const result = (ev as any).result
         const isError = Boolean((ev as any).isError)
+
+        const taskCall = this.taskToolArgs.get(toolCallId)
+        if (taskCall) {
+          this.taskToolArgs.delete(toolCallId)
+          if (
+            !isError &&
+            applyTaskToolResult(this.taskPlan, taskCall.toolName, taskCall.args, toolResultToText(result))
+          ) {
+            this.emitPlan()
+          }
+        }
+
         if (this.bashToolCallIds.has(toolCallId)) {
           this.emitBashOutputUpdate({
             toolCallId,
@@ -957,9 +1017,8 @@ export class PiAcpSession {
       }
 
       case 'agent_settled': {
-        // Ensure all updates derived from pi events are delivered before we resolve
-        // the ACP `session/prompt` request.
-        void this.flushEmits().finally(() => {
+        // Publish usage and deliver all pending updates before resolving `session/prompt`.
+        void this.publishContextUsage().finally(() => {
           const reason: StopReason = this.cancelRequested ? 'cancelled' : 'end_turn'
           this.pendingTurn?.resolve(reason)
           this.pendingTurn = null
@@ -1071,12 +1130,20 @@ export class PiAcpSession {
         const planCount = toCribPlanEntries(this.planState).length
         process.stderr.write(`[pi-acp] entry (${String(e.customType)}) -> plan:${planCount} fleet:[${fleet}]\n`)
       }
-      // One ACP plan surfaces both sources: the cribsheet plan first, then the live subagent fleet.
-      this.emit({
-        sessionUpdate: 'plan',
-        entries: [...toCribPlanEntries(this.planState), ...toPlanEntries(this.subagentFleet.values())]
-      })
+      this.emitPlan()
     }
+  }
+
+  // One ACP plan surfaces every source: cribsheet plan, pi-tasks list, then the subagent fleet.
+  private emitPlan(): void {
+    this.emit({
+      sessionUpdate: 'plan',
+      entries: [
+        ...toCribPlanEntries(this.planState),
+        ...toTaskPlanEntries(this.taskPlan),
+        ...toPlanEntries(this.subagentFleet.values())
+      ]
+    })
   }
 
   private async handleExtensionSelect(ev: PiRpcEvent, id: string): Promise<void> {
@@ -1188,15 +1255,28 @@ function formatAutoRetryMessage(ev: PiRpcEvent): string {
   return `Retrying (attempt ${attempt}/${maxAttempts}, waiting ${delaySeconds}s)...`
 }
 
-function toToolKind(toolName: string): ToolKind {
+export function toToolKind(toolName: string): ToolKind {
   switch (toolName) {
     case 'read':
+    case 'ls':
+    case 'list':
       return 'read'
     case 'write':
     case 'edit':
+    case 'patch':
       return 'edit'
     case 'bash':
       return 'execute'
+    case 'grep':
+    case 'find':
+    case 'search':
+      return 'search'
+    case 'web_fetch':
+    case 'webfetch':
+    case 'fetch':
+      return 'fetch'
+    case 'think':
+      return 'think'
     default:
       return 'other'
   }

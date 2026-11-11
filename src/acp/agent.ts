@@ -459,6 +459,9 @@ export class PiAcpAgent implements ACPAgent {
     // it will still be emitted as the first chunk of the first prompt.
     if (preludeText) setTimeout(() => session.sendStartupInfoIfPending(), 0)
 
+    // Paint the context-usage bar before the first turn.
+    setTimeout(() => this.publishContextUsage(session), 0)
+
     // Advertise slash commands (ACP: available_commands_update)
     // Important: some clients (e.g. Zed) will ignore notifications for an unknown sessionId.
     // So we must send this *after* the session/new response has been delivered.
@@ -1316,6 +1319,13 @@ export class PiAcpAgent implements ACPAgent {
     const session = await this.restoreSession(params.sessionId)
     await setSessionModel(session.proc, params.modelId)
     await emitConfigOptionsUpdate(this.conn, session.sessionId, session.proc)
+    this.publishContextUsage(session)
+  }
+
+  // The context window belongs to the model, so the usage bar goes stale on a switch.
+  private publishContextUsage(session: PiAcpSession): void {
+    if (typeof session.publishContextUsage !== 'function') return
+    void session.publishContextUsage()
   }
 
   async setSessionMode(params: SetSessionModeRequest): Promise<SetSessionModeResponse> {
@@ -1352,6 +1362,7 @@ export class PiAcpAgent implements ACPAgent {
 
     if (configId === MODEL_CONFIG_ID) {
       await setSessionModel(session.proc, params.value)
+      this.publishContextUsage(session)
     } else if (configId === THOUGHT_LEVEL_CONFIG_ID) {
       if (!isThinkingLevel(params.value)) {
         throw RequestError.invalidParams(`Unknown thinking level: ${params.value}`)

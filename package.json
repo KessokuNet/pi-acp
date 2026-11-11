@@ -1,7 +1,7 @@
 {
-  "name": "@geohar/pi-acp",
+  "name": "@korewachino/pi-acp",
   "version": "0.4.0",
-  "description": "ACP adapter for pi coding agent (fork), with a bundled pi extension for subagent→plan",
+  "description": "ACP adapter for pi coding agent (fork of @geohar/pi-acp), with a bundled pi extension for subagent→plan",
   "license": "MIT",
   "author": "Sergii Kozak <svkozak@gmail.com>",
   "contributors": [
@@ -9,15 +9,15 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/georgeharker/pi-acp.git"
+    "url": "git+https://github.com/korewaChino/pi-acp.git"
   },
   "publishConfig": {
     "access": "public"
   },
   "bugs": {
-    "url": "https://github.com/georgeharker/pi-acp/issues"
+    "url": "https://github.com/korewaChino/pi-acp/issues"
   },
-  "homepage": "https://github.com/georgeharker/pi-acp#readme",
+  "homepage": "https://github.com/korewaChino/pi-acp#readme",
   "keywords": [
     "pi-package",
     "pi",
@@ -45,7 +45,7 @@
     "extensions": [
       "./src/pi-extension.ts"
     ],
-    "image": "https://raw.githubusercontent.com/georgeharker/pi-acp/main/assets/preview.png"
+    "image": "https://raw.githubusercontent.com/korewaChino/pi-acp/main/assets/preview.png"
   },
   "scripts": {
     "dev": "tsx src/index.ts",

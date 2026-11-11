@@ -77,6 +77,12 @@ export class FakePiRpcProcess {
   async getMessages(): Promise<any> {
     return { messages: [] }
   }
+
+  sessionStats: unknown = null
+
+  async getSessionStats(): Promise<unknown> {
+    return this.sessionStats
+  }
 }
 
 export function asAgentConn(conn: FakeAgentSideConnection): AgentSideConnection {
