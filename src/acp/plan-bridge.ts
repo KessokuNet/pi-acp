@@ -1,4 +1,4 @@
-import type { PlanEntry } from '@agentclientprotocol/sdk'
+import type { PlanEntry } from '@agentclientprotocol/sdk/unstable'
 
 /**
  * Maps a cribsheet-style plan (surfaced on pi's in-process bus) into an ACP Plan.

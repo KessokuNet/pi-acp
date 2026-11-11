@@ -24,8 +24,8 @@ function send(obj) {
 }
 
 // Basic ACP handshake + one prompt.
+// ACP requires the initialize response before any other request.
 send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: 1 } })
-send({ jsonrpc: '2.0', id: 2, method: 'session/new', params: { cwd: cwd, mcpServers: [] } })
 
 // We'll send prompt a moment later; sessionId is in response to id=2.
 let sessionId = null
@@ -42,6 +42,10 @@ child.stdout.on('data', chunk => {
       msg = JSON.parse(line)
     } catch {
       continue
+    }
+
+    if (msg?.id === 1 && msg?.result) {
+      send({ jsonrpc: '2.0', id: 2, method: 'session/new', params: { cwd: cwd, mcpServers: [] } })
     }
 
     if (msg?.id === 2 && msg?.result?.sessionId && !sessionId) {

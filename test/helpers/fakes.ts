@@ -1,7 +1,7 @@
-import type { AgentSideConnection } from '@agentclientprotocol/sdk'
+import type { AcpClientConnection } from '../../src/acp/connection.js'
 import type { PiRpcEvent } from '../../src/pi-rpc/process.js'
 
-type SessionUpdateMsg = Parameters<AgentSideConnection['sessionUpdate']>[0]
+type SessionUpdateMsg = Parameters<AcpClientConnection['sessionUpdate']>[0]
 
 export class FakeAgentSideConnection {
   readonly updates: SessionUpdateMsg[] = []
@@ -85,7 +85,6 @@ export class FakePiRpcProcess {
   }
 }
 
-export function asAgentConn(conn: FakeAgentSideConnection): AgentSideConnection {
-  // We only implement the method(s) used by PiAcpSession in tests.
-  return conn as unknown as AgentSideConnection
+export function asAgentConn(conn: FakeAgentSideConnection): AcpClientConnection {
+  return conn as unknown as AcpClientConnection
 }

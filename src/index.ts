@@ -1,5 +1,6 @@
-import { AgentSideConnection, ndJsonStream } from '@agentclientprotocol/sdk'
+import { agent as agentApp, methods, ndJsonStream, type AgentConnection } from '@agentclientprotocol/sdk/unstable'
 import { PiAcpAgent } from './acp/agent.js'
+import { clientConnection } from './acp/connection.js'
 import { getPiCommand, shouldUseShellForPiCommand } from './pi-rpc/command.js'
 import { getPiCommandOverride } from './acp/pi-acp-settings.js'
 // Terminal Auth entrypoint. The ACP client launches the agent with `--terminal-login`.
@@ -50,12 +51,30 @@ const output = new ReadableStream<Uint8Array>({
 
 const stream = ndJsonStream(input, output)
 
-const agent = new AgentSideConnection(conn => new PiAcpAgent(conn), stream)
+// The client context is read lazily: handlers and sessions only run after `connect()` returns.
+const piAgent = new PiAcpAgent(clientConnection(() => connection.client))
+
+const agent = methods.agent
+const connection: AgentConnection = agentApp()
+  .onRequest(agent.initialize, ({ params }) => piAgent.initialize(params))
+  .onRequest(agent.authenticate, ({ params }) => piAgent.authenticate(params))
+  .onRequest(agent.logout, ({ params }) => piAgent.logout(params))
+  .onRequest(agent.session.new, ({ params }) => piAgent.newSession(params))
+  .onRequest(agent.session.load, ({ params }) => piAgent.loadSession(params))
+  .onRequest(agent.session.list, ({ params }) => piAgent.listSessions(params))
+  .onRequest(agent.session.delete, ({ params }) => piAgent.deleteSession(params))
+  .onRequest(agent.session.resume, ({ params }) => piAgent.resumeSession(params))
+  .onRequest(agent.session.close, ({ params }) => piAgent.closeSession(params))
+  .onRequest(agent.session.setMode, ({ params }) => piAgent.setSessionMode(params))
+  .onRequest(agent.session.setConfigOption, ({ params }) => piAgent.setSessionConfigOption(params))
+  .onRequest(agent.session.prompt, ({ params }) => piAgent.prompt(params))
+  .onNotification(agent.session.cancel, ({ params }) => piAgent.cancel(params))
+  .connect(stream)
 
 function shutdown() {
   try {
     // Best-effort: dispose session subprocesses when the client disconnects.
-    ;(agent as any)?.agent?.dispose?.()
+    piAgent.dispose()
   } catch {
     // ignore
   }

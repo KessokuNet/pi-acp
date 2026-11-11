@@ -1,4 +1,4 @@
-import type { PlanEntry } from '@agentclientprotocol/sdk'
+import type { PlanEntry } from '@agentclientprotocol/sdk/unstable'
 
 /**
  * Derives an ACP plan from pi-tasks' tool calls (`TaskCreate` / `TaskUpdate`) seen on the RPC event

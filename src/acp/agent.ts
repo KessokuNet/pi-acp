@@ -1,7 +1,5 @@
 import {
   RequestError,
-  type Agent as ACPAgent,
-  type AgentSideConnection,
   type AuthenticateRequest,
   type CancelNotification,
   type InitializeRequest,
@@ -29,7 +27,8 @@ import {
   type LogoutRequest,
   type LogoutResponse,
   type ClientCapabilities
-} from '@agentclientprotocol/sdk'
+} from '@agentclientprotocol/sdk/unstable'
+import type { AcpClientConnection } from './connection.js'
 import { getAuthMethods } from './auth.js'
 import { SessionManager, type PiAcpSession } from './session.js'
 import { SessionStore } from './session-store.js'
@@ -61,7 +60,7 @@ import { maybeAuthRequiredError } from './auth-required.js'
 import { writeMcpConfigForPi, buildMcpNotice, cleanupStaleGeneratedConfig, combinerEnvFor } from './mcp-config.js'
 import { isAbsolute } from 'node:path'
 import { existsSync, readFileSync, realpathSync, readdirSync, statSync, unlinkSync } from 'node:fs'
-import type { AvailableCommand } from '@agentclientprotocol/sdk'
+import type { AvailableCommand } from '@agentclientprotocol/sdk/unstable'
 import { join, dirname, basename } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { normalizeAdditionalDirectories } from './workspace-roots.js'
@@ -135,8 +134,8 @@ import { fileURLToPath } from 'node:url'
 
 const pkg = readNearestPackageJson(import.meta.url)
 
-export class PiAcpAgent implements ACPAgent {
-  private readonly conn: AgentSideConnection
+export class PiAcpAgent {
+  private readonly conn: AcpClientConnection
   private readonly sessions = new SessionManager()
   private readonly store = new SessionStore()
   private readonly restoringSessions = new Map<string, Promise<PiAcpSession>>()
@@ -152,7 +151,7 @@ export class PiAcpAgent implements ACPAgent {
   // Remember recent session cwd and use it as the default filter.
   private lastSessionCwd: string | null = null
 
-  constructor(conn: AgentSideConnection, _config?: unknown) {
+  constructor(conn: AcpClientConnection, _config?: unknown) {
     this.conn = conn
     void _config
   }
@@ -521,6 +520,14 @@ export class PiAcpAgent implements ACPAgent {
 
       if (cmd === 'compact') {
         const customInstructions = args.join(' ').trim() || undefined
+
+        // The compaction_update card already shows the outcome, including failures.
+        if (this.clientCapabilities?.session?.compaction != null) {
+          await session.proc.compact(customInstructions).catch(() => {})
+          this.publishContextUsage(session)
+          return { stopReason: 'end_turn' }
+        }
+
         const res = await session.proc.compact(customInstructions)
 
         const r: any = res && typeof res === 'object' ? (res as any) : null
@@ -1315,13 +1322,6 @@ export class PiAcpAgent implements ACPAgent {
     return {}
   }
 
-  async unstable_setSessionModel(params: { sessionId: string; modelId: string }): Promise<void> {
-    const session = await this.restoreSession(params.sessionId)
-    await setSessionModel(session.proc, params.modelId)
-    await emitConfigOptionsUpdate(this.conn, session.sessionId, session.proc)
-    this.publishContextUsage(session)
-  }
-
   // The context window belongs to the model, so the usage bar goes stale on a switch.
   private publishContextUsage(session: PiAcpSession): void {
     if (typeof session.publishContextUsage !== 'function') return
@@ -1573,7 +1573,7 @@ async function getModelState(
 }
 
 async function emitConfigOptionsUpdate(
-  conn: AgentSideConnection,
+  conn: AcpClientConnection,
   sessionId: string,
   proc: PiRpcProcess
 ): Promise<SessionConfigOption[]> {

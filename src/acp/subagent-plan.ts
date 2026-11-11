@@ -1,4 +1,4 @@
-import type { PlanEntry } from '@agentclientprotocol/sdk'
+import type { PlanEntry } from '@agentclientprotocol/sdk/unstable'
 
 /**
  * Maps the pi-subagents fleet into an ACP Plan. pi itself emits no ACP plans, so the plan channel

@@ -458,55 +458,103 @@ test('PiAcpSession: emits agent_message_chunk for auto_retry_end', async () => {
   })
 })
 
-test('PiAcpSession: emits agent_message_chunk for auto_compaction_start', async () => {
+function compactionSession(clientCapabilities?: object) {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()
-
   new PiAcpSession({
     sessionId: 's1',
     cwd: process.cwd(),
     mcpServers: [],
     proc: proc as any,
     conn: asAgentConn(conn),
-    fileCommands: []
+    fileCommands: [],
+    clientCapabilities
   })
+  return { conn, proc }
+}
 
-  proc.emit({ type: 'auto_compaction_start' } as any)
+test('PiAcpSession: falls back to text chunks for compaction without the client capability', async () => {
+  const { conn, proc } = compactionSession()
 
+  proc.emit({ type: 'compaction_start', reason: 'threshold' })
+  proc.emit({
+    type: 'compaction_end',
+    reason: 'threshold',
+    result: { summary: 'S' },
+    aborted: false,
+    willRetry: false
+  })
   await new Promise(r => setTimeout(r, 0))
 
-  assert.equal(conn.updates.length, 1)
-  assert.deepEqual(conn.updates[0]!.update, {
-    sessionUpdate: 'agent_message_chunk',
-    content: { type: 'text', text: 'Context nearing limit, running automatic compaction...' }
-  })
+  assert.deepEqual(
+    conn.updates.map(u => u.update),
+    [
+      { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Compacting context...' } },
+      {
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text: 'Compaction finished; context was summarized to continue the session.' }
+      }
+    ]
+  )
 })
 
-test('PiAcpSession: emits agent_message_chunk for auto_compaction_end', async () => {
-  const conn = new FakeAgentSideConnection()
-  const proc = new FakePiRpcProcess()
+test('PiAcpSession: emits compaction_update in_progress then completed with the summary', async () => {
+  const { conn, proc } = compactionSession({ session: { compaction: {} } })
 
-  new PiAcpSession({
-    sessionId: 's1',
-    cwd: process.cwd(),
-    mcpServers: [],
-    proc: proc as any,
-    conn: asAgentConn(conn),
-    fileCommands: []
+  proc.emit({ type: 'compaction_start', reason: 'threshold' })
+  proc.emit({
+    type: 'compaction_end',
+    reason: 'threshold',
+    result: { summary: 'Earlier work summarized.' },
+    aborted: false,
+    willRetry: false
   })
-
-  proc.emit({ type: 'auto_compaction_end' } as any)
-
   await new Promise(r => setTimeout(r, 0))
 
-  assert.equal(conn.updates.length, 1)
-  assert.deepEqual(conn.updates[0]!.update, {
-    sessionUpdate: 'agent_message_chunk',
-    content: {
-      type: 'text',
-      text: 'Automatic compaction finished; context was summarized to continue the session.'
-    }
+  const [start, end] = conn.updates.map(u => u.update as any)
+  assert.equal(start.sessionUpdate, 'compaction_update')
+  assert.equal(start.status, 'in_progress')
+  assert.equal(end.sessionUpdate, 'compaction_update')
+  assert.equal(end.compactionId, start.compactionId)
+  assert.equal(end.status, 'completed')
+  assert.deepEqual(end.summary, [{ type: 'text', text: 'Earlier work summarized.' }])
+})
+
+test('PiAcpSession: reports cancelled and failed compactions', async () => {
+  const { conn, proc } = compactionSession({ session: { compaction: {} } })
+
+  proc.emit({ type: 'compaction_start', reason: 'manual' })
+  proc.emit({ type: 'compaction_end', reason: 'manual', aborted: true, willRetry: false })
+  proc.emit({ type: 'compaction_start', reason: 'overflow' })
+  proc.emit({
+    type: 'compaction_end',
+    reason: 'overflow',
+    aborted: false,
+    willRetry: false,
+    errorMessage: 'too big'
   })
+  await new Promise(r => setTimeout(r, 0))
+
+  const statuses = conn.updates.map(u => (u.update as any).status)
+  assert.deepEqual(statuses, ['in_progress', 'cancelled', 'in_progress', 'failed'])
+  assert.equal((conn.updates[3]!.update as any).error, 'too big')
+})
+
+test('PiAcpSession: emits retry notices when the client supports them', async () => {
+  const { conn, proc } = compactionSession({ session: { notices: {} } })
+
+  proc.emit({ type: 'auto_retry_start', attempt: 1, maxAttempts: 3, delayMs: 2000, errorMessage: 'secret' })
+  proc.emit({ type: 'auto_retry_end', success: true, attempt: 1 })
+  proc.emit({ type: 'auto_retry_end', success: false, attempt: 3, finalError: 'secret' })
+  await new Promise(r => setTimeout(r, 0))
+
+  assert.deepEqual(
+    conn.updates.map(u => u.update),
+    [
+      { sessionUpdate: 'notice', severity: 'warning', title: 'Retrying (attempt 1/3, waiting 2s)...' },
+      { sessionUpdate: 'notice', severity: 'error', title: 'Retries exhausted' }
+    ]
+  )
 })
 
 test('PiAcpSession: preserves ordering when auto_retry_start is interleaved with text_delta events', async () => {

@@ -1,5 +1,4 @@
 import type {
-  AgentSideConnection,
   ClientCapabilities,
   ContentBlock,
   McpServer,
@@ -8,8 +7,9 @@ import type {
   ToolCallContent,
   ToolCallLocation,
   ToolKind
-} from '@agentclientprotocol/sdk'
-import { RequestError } from '@agentclientprotocol/sdk'
+} from '@agentclientprotocol/sdk/unstable'
+import { RequestError } from '@agentclientprotocol/sdk/unstable'
+import type { AcpClientConnection } from './connection.js'
 import { readFileSync } from 'node:fs'
 import { isAbsolute, resolve as resolvePath } from 'node:path'
 import { PiRpcProcess, PiRpcSpawnError, type PiRpcEvent } from '../pi-rpc/process.js'
@@ -56,7 +56,7 @@ import {
 type SessionCreateParams = {
   cwd: string
   mcpServers: McpServer[]
-  conn: AgentSideConnection
+  conn: AcpClientConnection
   fileCommands?: import('./slash-commands.js').FileSlashCommand[]
   piCommand?: string
   /** ACP additionalDirectories: extra workspace roots beyond cwd (absolute paths). */
@@ -87,7 +87,7 @@ type QueuedTurn = {
   reject: (err: unknown) => void
 }
 
-type PermissionResponse = Awaited<ReturnType<AgentSideConnection['requestPermission']>>
+type PermissionResponse = Awaited<ReturnType<AcpClientConnection['requestPermission']>>
 
 const CONFIRM_PERMISSION_OPTIONS: PermissionOption[] = [
   { optionId: 'yes', name: 'Yes', kind: 'allow_once' },
@@ -346,7 +346,7 @@ export class PiAcpSession {
   private startupInfoSent = false
 
   readonly proc: PiRpcProcess
-  private readonly conn: AgentSideConnection
+  private readonly conn: AcpClientConnection
   private readonly fileCommands: FileSlashCommand[]
 
   // Used to map abort semantics to ACP stopReason.
@@ -373,6 +373,7 @@ export class PiAcpSession {
   private bashToolCallIds = new Set<string>()
   private bashOutputSnapshots = new Map<string, string>()
   private taskPlan: TaskPlanState = newTaskPlanState()
+  private compactionId: string | undefined
   private taskToolArgs = new Map<string, { toolName: string; args: unknown }>()
 
   // Ensure `session/update` notifications are sent in order and can be awaited
@@ -384,7 +385,7 @@ export class PiAcpSession {
     cwd: string
     mcpServers: McpServer[]
     proc: PiRpcProcess
-    conn: AgentSideConnection
+    conn: AcpClientConnection
     fileCommands?: FileSlashCommand[]
     additionalDirectories?: string[]
     mcpConfigCleanup?: () => void
@@ -957,40 +958,39 @@ export class PiAcpSession {
       }
 
       case 'auto_retry_start': {
-        this.emit({
-          sessionUpdate: 'agent_message_chunk',
-          content: { type: 'text', text: formatAutoRetryMessage(ev) } satisfies ContentBlock
-        })
+        if (this.clientSupportsNotices()) {
+          this.emit({ sessionUpdate: 'notice', severity: 'warning', title: formatAutoRetryMessage(ev) })
+        } else {
+          this.emit({
+            sessionUpdate: 'agent_message_chunk',
+            content: { type: 'text', text: formatAutoRetryMessage(ev) } satisfies ContentBlock
+          })
+        }
         break
       }
 
       case 'auto_retry_end': {
-        this.emit({
-          sessionUpdate: 'agent_message_chunk',
-          content: { type: 'text', text: 'Retry finished, resuming.' } satisfies ContentBlock
-        })
+        if (this.clientSupportsNotices()) {
+          // A successful retry needs no banner; the resumed turn speaks for itself.
+          if ((ev as { success?: unknown }).success === false) {
+            this.emit({ sessionUpdate: 'notice', severity: 'error', title: 'Retries exhausted' })
+          }
+        } else {
+          this.emit({
+            sessionUpdate: 'agent_message_chunk',
+            content: { type: 'text', text: 'Retry finished, resuming.' } satisfies ContentBlock
+          })
+        }
         break
       }
 
-      case 'auto_compaction_start': {
-        this.emit({
-          sessionUpdate: 'agent_message_chunk',
-          content: {
-            type: 'text',
-            text: 'Context nearing limit, running automatic compaction...'
-          } satisfies ContentBlock
-        })
+      case 'compaction_start': {
+        this.handleCompactionStart()
         break
       }
 
-      case 'auto_compaction_end': {
-        this.emit({
-          sessionUpdate: 'agent_message_chunk',
-          content: {
-            type: 'text',
-            text: 'Automatic compaction finished; context was summarized to continue the session.'
-          } satisfies ContentBlock
-        })
+      case 'compaction_end': {
+        this.handleCompactionEnd(ev)
         break
       }
 
@@ -1144,6 +1144,66 @@ export class PiAcpSession {
         ...toPlanEntries(this.subagentFleet.values())
       ]
     })
+  }
+
+  private clientSupportsNotices(): boolean {
+    return this.clientCapabilities?.session?.notices != null
+  }
+
+  private clientSupportsCompaction(): boolean {
+    return this.clientCapabilities?.session?.compaction != null
+  }
+
+  private handleCompactionStart(): void {
+    if (!this.clientSupportsCompaction()) {
+      this.emit({
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text: 'Compacting context...' } satisfies ContentBlock
+      })
+      return
+    }
+
+    this.compactionId = crypto.randomUUID()
+    this.emit({ sessionUpdate: 'compaction_update', compactionId: this.compactionId, status: 'in_progress' })
+  }
+
+  private handleCompactionEnd(ev: PiRpcEvent): void {
+    const end = ev as { aborted?: unknown; errorMessage?: unknown; result?: unknown }
+    const summary = (end.result as { summary?: unknown } | undefined)?.summary
+    const errorMessage = typeof end.errorMessage === 'string' ? end.errorMessage : undefined
+
+    if (!this.clientSupportsCompaction()) {
+      const text =
+        end.aborted === true
+          ? 'Compaction cancelled.'
+          : typeof summary === 'string'
+            ? 'Compaction finished; context was summarized to continue the session.'
+            : 'Compaction failed.'
+      this.emit({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text } satisfies ContentBlock })
+      return
+    }
+
+    // pi can end a compaction it never reported starting (e.g. a failed manual attempt).
+    const compactionId = this.compactionId ?? crypto.randomUUID()
+    this.compactionId = undefined
+
+    if (end.aborted === true) {
+      this.emit({ sessionUpdate: 'compaction_update', compactionId, status: 'cancelled' })
+    } else if (typeof summary === 'string') {
+      this.emit({
+        sessionUpdate: 'compaction_update',
+        compactionId,
+        status: 'completed',
+        summary: [{ type: 'text', text: summary }]
+      })
+    } else {
+      this.emit({
+        sessionUpdate: 'compaction_update',
+        compactionId,
+        status: 'failed',
+        error: errorMessage ?? 'Compaction failed'
+      })
+    }
   }
 
   private async handleExtensionSelect(ev: PiRpcEvent, id: string): Promise<void> {
