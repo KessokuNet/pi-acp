@@ -52,6 +52,7 @@ On top of upstream it adds:
 - Extension UI
   - Notifications from pi extensions become ACP `notice` updates when the client advertises `session.notices`, and stay as assistant text otherwise. Both carry `_meta.piAcp.notify.level`
   - `input` and `editor` extension requests are collected through `elicitation/create` (form mode) when the client advertises elicitation, and are cancelled with a visible note otherwise
+  - `select` extension requests become a single-choice elicitation form (`oneOf` options) for clients that advertise elicitation, so questionnaire tools such as `@juicesharp/rpiv-ask-user-question` render as real option lists; other clients still get the choices through `session/request_permission`
   - `setTitle` extension requests are relayed as a `session_info_update`
   - `setStatus` extension requests (the text-bar channel behind `/usage` and status extensions such as `@specode/pi-subscription-usage`) are republished as `session_info_update._meta.piAcp.status`, a map of status key to text, with an entry removed when the extension clears it. Clients that read `_meta` can render it; Zed does not, so its UI shows nothing
 - Session persistence
@@ -275,7 +276,7 @@ Project layout:
   client's buffer before an edit, but writes still go through pi directly.
 - No ACP terminal delegation (`terminal/*`). pi executes commands locally and the adapter only
   mirrors their output as a display-only terminal.
-- No ACP permission gating (`session/request_permission`): pi executes tools locally and does not surface pre-execution tool intents over RPC, so the adapter cannot gate them yet. Permission requests are only used to render pi extension `select`/`confirm` prompts.
+- No ACP permission gating (`session/request_permission`): pi executes tools locally and does not surface pre-execution tool intents over RPC, so the adapter cannot gate them yet. Permission requests are only used to render pi extension `confirm` prompts, plus `select` prompts for clients without elicitation support.
 
 ## MCP servers
 

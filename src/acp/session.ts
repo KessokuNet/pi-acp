@@ -1509,6 +1509,12 @@ export class PiAcpSession {
       return
     }
 
+    if (this.clientSupportsElicitation()) {
+      const value = await this.chooseOptionThroughElicitation(ev, options)
+      await this.proc.sendExtensionUiResponse(value === null ? { id, cancelled: true } : { id, value })
+      return
+    }
+
     const permissionOptions: PermissionOption[] = options.map((name, index) => ({
       optionId: `${CHOICE_OPTION_PREFIX}${index}`,
       name,
@@ -1524,6 +1530,45 @@ export class PiAcpSession {
     const index = selectedOptionId === null ? null : optionIndex(selectedOptionId)
     const value = index === null ? null : (options.at(index) ?? null)
     await this.proc.sendExtensionUiResponse(value === null ? { id, cancelled: true } : { id, value })
+  }
+
+  /**
+   * pi `select` prompts become a single-choice elicitation field. Clients render the `oneOf`
+   * entries as a list, which is what a questionnaire (e.g. rpiv-ask-user-question) expects.
+   */
+  private async chooseOptionThroughElicitation(ev: PiRpcEvent, options: string[]): Promise<string | null> {
+    const title = stringProp(ev, 'title') ?? 'Choose an option'
+
+    let accepted: { choice?: unknown } | null = null
+    try {
+      const response = await this.conn.createElicitation({
+        sessionId: this.sessionId,
+        message: title,
+        mode: 'form',
+        requestedSchema: {
+          type: 'object',
+          title,
+          properties: {
+            choice: {
+              type: 'string',
+              title,
+              oneOf: options.map((name, index) => ({ const: `${CHOICE_OPTION_PREFIX}${index}`, title: name }))
+            }
+          },
+          required: ['choice']
+        }
+      })
+
+      if (response.action === 'accept') {
+        accepted = response.content ?? null
+      }
+    } catch {
+      return null
+    }
+
+    const choice = accepted?.choice
+    const index = typeof choice === 'string' ? optionIndex(choice) : null
+    return index === null ? null : (options.at(index) ?? null)
   }
 
   private async handleExtensionConfirm(ev: PiRpcEvent, id: string): Promise<void> {
