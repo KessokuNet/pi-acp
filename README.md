@@ -96,9 +96,10 @@ that crosses RPC as `entry_appended`.
 
 ### Plans
 
-pi's RPC stream carries no plan events, so pi-acp assembles the ACP `plan` from three sources and
-merges them into one flat task list: plan snapshots on pi's bus, `TaskCreate` / `TaskUpdate` tool
-calls, and the subagent fleet. Each source is tagged, so a client can group them.
+pi's RPC stream carries no plan events, so pi-acp assembles the ACP `plan` from the custom entries
+and tool calls that carry progress: a goal row from pi-goal or pi-code, plan snapshots on pi's bus,
+`TaskCreate` / `TaskUpdate` tool calls, pi-code's todo list, and the subagent fleet. Each source is
+tagged, so a client can group them.
 
 ### Supported extensions
 
@@ -110,6 +111,8 @@ calls, and the subagent fleet. Each source is tagged, so a client can group them
 | `@specode/pi-subscription-usage`     | Status text on `session_info_update._meta.piAcp.status`, and quota windows (`5h 88% ↻4h12m · 1w 89% ↻5d19h`) parsed into `usage_update._meta.piAcp.meters` as `{label, percent, resetInMs, text}`, re-sent on change and dropped when cleared. Zed ignores `_meta`, so nothing renders there yet |
 | `@juicesharp/rpiv-ask-user-question` | One elicitation option list per question, with the "Type something." row and the multi-select text input intact; `session/request_permission` for clients without form elicitation                                                                                                               |
 | `@fahrizkyputra/pi-auto-resume`      | Resume countdown in the status map, warnings as `notice` updates                                                                                                                                                                                                                                 |
+| `@narumitw/pi-goal`                  | One `Goal: …` row from its `goal-state` entries, `in_progress` until the goal's own `goal_complete` tool records `complete`. Statuses ACP cannot express (`waiting`, `blocked`, `usage_limited`, `budget_limited`) stay in `_meta.piAcp.goal`                                                    |
+| `pi-code`                            | Plan rows for its `todo` tool (`pi-code:todo` entries, statuses map 1:1) and its `goal` entry, which shares the goal row with pi-goal on a newest-wins basis. Its `question` tool falls back to `select` over RPC, so it uses the elicitation path. Checkpoints and plan mode stay terminal-only |
 
 ## Prerequisites
 

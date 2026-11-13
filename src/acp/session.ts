@@ -56,6 +56,14 @@ import {
   toTaskPlanEntries,
   type TaskPlanState
 } from './task-plan.js'
+import {
+  GOAL_STATE_CUSTOM_TYPE,
+  PI_CODE_GOAL_CUSTOM_TYPE,
+  parseGoalEntry,
+  toGoalPlanEntries,
+  type GoalItem
+} from './goal-plan.js'
+import { parseTodoEntry, toTodoPlanEntries, PI_CODE_TODO_CUSTOM_TYPE, type TodoItem } from './todo-plan.js'
 
 type SessionCreateParams = {
   cwd: string
@@ -373,6 +381,8 @@ export class PiAcpSession {
   private bashToolCallIds = new Set<string>()
   private bashOutputSnapshots = new Map<string, string>()
   private taskPlan: TaskPlanState = newTaskPlanState()
+  private piCodeTodos: TodoItem[] = []
+  private goal: GoalItem | null = null
   private compactionId: string | undefined
   private readonly subagents: SubagentSessions
   private taskToolArgs = new Map<string, { toolName: string; args: unknown }>()
@@ -1161,7 +1171,7 @@ export class PiAcpSession {
       }
 
       case 'entry_appended': {
-        this.handleSubagentEntry((ev as any).entry)
+        this.handleExtensionEntry((ev as any).entry)
         break
       }
 
@@ -1394,15 +1404,18 @@ export class PiAcpSession {
 
   /**
    * Accumulate plan + subagent state from custom entries forwarded over RPC as `entry_appended`,
-   * and emit a single combined ACP `plan`. Three sources feed it:
+   * and emit a single combined ACP `plan`. Sources:
    *  - `acp:subagents` (our bundled extension): live subagent lifecycle records, or `{ clear: true }`.
    *  - `subagents:record` (pi-subagents' own): the final subagent status + result/error + timing.
    *  - `acp:plan` (our bundled extension): cribsheet-style plan snapshots/updates (see plan-bridge.ts).
-   * The emitted plan lists the cribsheet plan first, then the live subagent fleet.
+   *  - `pi-code:todo` (pi-code): the todo tool's full list after every change.
+   *  - `goal-state` (pi-goal) and `goal` (pi-code): the session goal and its state.
+   * The emitted plan lists the goal first, then the cribsheet plan, then the live subagent fleet.
    */
-  private handleSubagentEntry(entry: unknown): void {
+  private handleExtensionEntry(entry: unknown): void {
     const e = entry as { type?: unknown; customType?: unknown; data?: unknown } | null
     if (e?.type !== 'custom') return
+    if (typeof e.customType !== 'string') return
 
     let changed = false
 
@@ -1426,6 +1439,16 @@ export class PiAcpSession {
       this.subagentFleet.set(rec.id, merged)
       this.subagents.onAgent(merged)
       changed = true
+    } else if (e.customType === PI_CODE_TODO_CUSTOM_TYPE) {
+      const todos = parseTodoEntry(e.data)
+      if (!todos) return
+      this.piCodeTodos = todos
+      changed = true
+    } else if (e.customType === GOAL_STATE_CUSTOM_TYPE || e.customType === PI_CODE_GOAL_CUSTOM_TYPE) {
+      const parsed = parseGoalEntry(e.customType, e.data)
+      if (!parsed) return
+      this.goal = parsed.goal
+      changed = true
     } else if (e.customType === PLAN_CUSTOM_TYPE) {
       const op = parsePlanEntry(e.data)
       if (!op) return
@@ -1438,20 +1461,25 @@ export class PiAcpSession {
       if (getPiAcpDebug()) {
         const fleet = Array.from(this.subagentFleet.values(), a => `${a.id.slice(0, 8)}=${a.status ?? '?'}`).join(', ')
         const planCount = toCribPlanEntries(this.planState).length
-        process.stderr.write(`[pi-acp] entry (${String(e.customType)}) -> plan:${planCount} fleet:[${fleet}]\n`)
+        process.stderr.write(
+          `[pi-acp] entry (${e.customType}) -> plan:${planCount} goal:${this.goal ? 'y' : 'n'} todos:${this.piCodeTodos.length} fleet:[${fleet}]\n`
+        )
       }
       this.emitPlan()
     }
   }
 
-  // One ACP plan surfaces every source: cribsheet plan, pi-tasks list, then the subagent fleet.
-  // Clients with native subagent cards already show the fleet, so it stays out of their plan.
+  // One ACP plan surfaces every source: goal, cribsheet plan, pi-tasks list, pi-code todos, then
+  // the subagent fleet. Clients with native subagent cards already show the fleet, so it stays out
+  // of their plan.
   private emitPlan(): void {
     this.emit({
       sessionUpdate: 'plan',
       entries: [
+        ...toGoalPlanEntries(this.goal),
         ...toCribPlanEntries(this.planState),
         ...toTaskPlanEntries(this.taskPlan),
+        ...toTodoPlanEntries(this.piCodeTodos),
         ...(this.clientSupportsSubagents() ? [] : toPlanEntries(this.subagentFleet.values()))
       ]
     })
