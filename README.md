@@ -53,6 +53,7 @@ On top of upstream it adds:
   - Notifications from pi extensions become ACP `notice` updates when the client advertises `session.notices`, and stay as assistant text otherwise. Both carry `_meta.piAcp.notify.level`
   - `input` and `editor` extension requests are collected through `elicitation/create` (form mode) when the client advertises elicitation, and are cancelled with a visible note otherwise
   - `setTitle` extension requests are relayed as a `session_info_update`
+  - `setStatus` extension requests (the text-bar channel behind `/usage` and status extensions such as `@specode/pi-subscription-usage`) are republished as `session_info_update._meta.piAcp.status`, a map of status key to text, with an entry removed when the extension clears it. Clients that read `_meta` can render it; Zed does not, so its UI shows nothing
 - Session persistence
   - pi stores its own sessions in `~/.pi/agent/sessions/...`
   - `pi-acp` stores a small mapping file at `~/.pi/pi-acp/session-map.json` so `session/load` can reattach to a previous pi session file

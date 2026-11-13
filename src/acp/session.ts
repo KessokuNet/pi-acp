@@ -334,6 +334,7 @@ export class PiAcpSession {
 
   private startupInfo: string | null = null
   private startupInfoSent = false
+  private extensionStatus = new Map<string, string>()
 
   readonly proc: PiRpcProcess
   private readonly conn: AcpClientConnection
@@ -1284,7 +1285,28 @@ export class PiAcpSession {
       return
     }
 
+    if (method === 'setStatus') {
+      this.applyExtensionStatus(ev)
+      await this.proc.sendExtensionUiResponse({ id, cancelled: true })
+      return
+    }
+
     await this.proc.sendExtensionUiResponse({ id, cancelled: true })
+  }
+
+  /** Status-bar text from a pi extension, republished for ACP clients as `_meta.piAcp.status`. */
+  private applyExtensionStatus(ev: PiRpcEvent): void {
+    const key = stringProp(ev, 'statusKey')
+    if (!key) return
+
+    const text = stringProp(ev, 'statusText')
+    if (text) this.extensionStatus.set(key, text)
+    else this.extensionStatus.delete(key)
+
+    this.emit({
+      sessionUpdate: 'session_info_update',
+      _meta: { piAcp: { status: Object.fromEntries(this.extensionStatus) } }
+    })
   }
 
   /**

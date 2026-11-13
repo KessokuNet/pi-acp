@@ -1095,6 +1095,84 @@ test('PiAcpSession: relays an extension setTitle as a session_info_update', asyn
   assert.deepEqual(proc.extensionUiResponses, [{ id: 'title-1', cancelled: true }])
 })
 
+test('PiAcpSession: republishes extension setStatus text as session_info_update _meta', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  proc.emit({
+    type: 'extension_ui_request',
+    id: 'st-1',
+    method: 'setStatus',
+    statusKey: 'subscription-usage',
+    statusText: '5h 88% ↻4h12m · 1w 89% ↻5d19h'
+  })
+  proc.emit({
+    type: 'extension_ui_request',
+    id: 'st-2',
+    method: 'setStatus',
+    statusKey: 'subagents',
+    statusText: '2 running'
+  })
+
+  await new Promise(r => setTimeout(r, 0))
+
+  assert.equal(conn.updates.length, 2)
+  assert.equal(conn.updates[0]!.update.sessionUpdate, 'session_info_update')
+  assert.deepEqual((conn.updates[0]!.update as any)._meta, {
+    piAcp: { status: { 'subscription-usage': '5h 88% ↻4h12m · 1w 89% ↻5d19h' } }
+  })
+  assert.deepEqual((conn.updates[1]!.update as any)._meta, {
+    piAcp: {
+      status: { 'subscription-usage': '5h 88% ↻4h12m · 1w 89% ↻5d19h', subagents: '2 running' }
+    }
+  })
+  assert.deepEqual(proc.extensionUiResponses, [
+    { id: 'st-1', cancelled: true },
+    { id: 'st-2', cancelled: true }
+  ])
+})
+
+test('PiAcpSession: clears a status entry when the extension sends no text', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  proc.emit({
+    type: 'extension_ui_request',
+    id: 'st-1',
+    method: 'setStatus',
+    statusKey: 'subscription-usage',
+    statusText: '5h 88% ↻4h12m'
+  })
+  proc.emit({
+    type: 'extension_ui_request',
+    id: 'st-2',
+    method: 'setStatus',
+    statusKey: 'subscription-usage'
+  })
+
+  await new Promise(r => setTimeout(r, 0))
+
+  assert.deepEqual((conn.updates.at(-1)!.update as any)._meta, { piAcp: { status: {} } })
+})
+
 test('PiAcpSession: collects extension input through elicitation', async () => {
   const conn = new FakeAgentSideConnection()
   conn.nextElicitationResponse = { action: 'accept', content: { value: 'cappy' } }
