@@ -94,22 +94,28 @@ event bus, which RPC does not forward. The bundled bridge extension (`src/pi-ext
 inside pi, subscribes to those channels, and republishes each event as a persisted `CustomEntry`
 that crosses RPC as `entry_appended`.
 
-### `@tintinweb/pi-subagents`
+### Plans
 
-The live fleet and pi-subagents' own final records become one ACP `plan`, each subagent a task with
+pi's RPC stream carries no plan events, so pi-acp assembles the ACP `plan` from three sources and
+merges them into one flat task list: plan snapshots on pi's bus, `TaskCreate` / `TaskUpdate` tool
+calls, and the subagent fleet. Each source is tagged, so a client can group them.
+
+#### `@tintinweb/pi-subagents`
+
+The live fleet and pi-subagents' own final records become plan entries, each subagent a task with
 `pending` / `in_progress` / `completed` status, and each spawned child is linked to its `Agent` tool
 call as an ACP subagent session. See [Subagents as tasks](#subagents-as-tasks).
 
-### Plan sources (`pi-cribsheet`)
+#### `pi-cribsheet`
 
-Anything publishing on the `plan:snapshot` and `plan:update` bus channels — `pi-cribsheet` is the
-reference producer — is merged per namespace and emitted as an ACP `plan`, tagged so a client can
-group it apart from the subagent fleet.
+Any plan source publishing on the `plan:snapshot` and `plan:update` bus channels is merged per
+namespace and emitted as plan entries, tagged so a client can group it apart from the subagent fleet.
+`pi-cribsheet` is the reference producer.
 
-### `pi-tasks`
+#### `pi-tasks`
 
 `TaskCreate` and `TaskUpdate` tool calls are read from the RPC event stream and folded into the same
-`plan`. No bridge code is involved; the tool calls carry everything.
+plan. No bridge code is involved; the tool calls carry everything.
 
 ### `@specode/pi-subscription-usage`
 
@@ -270,7 +276,10 @@ Other built-in commands:
 
 ## Subagents as tasks
 
-pi's RPC stream carries no plan events, so pi-acp assembles the ACP `plan` (task-list) channel from the sources it can see: plan snapshots published on pi's bus, `TaskCreate` / `TaskUpdate` tool calls, and the subagent fleet. With the [pi-subagents](https://github.com/tintinweb/pi-subagents) extension installed, each running subagent becomes a task with `pending` / `in_progress` / `completed` status. See [Extension integrations](#extension-integrations) for the other two sources.
+The subagent fleet is one of the three plan sources described in
+[Extension integrations](#extension-integrations). With the
+[pi-subagents](https://github.com/tintinweb/pi-subagents) extension installed, each running subagent
+becomes a task with `pending` / `in_progress` / `completed` status.
 
 Because pi's RPC mode does not forward pi's in-process event bus (`subagents:*`), the bridging is
 done by a pi extension. The `pi-acp` package doubles as that extension (`src/pi-extension.ts`,
