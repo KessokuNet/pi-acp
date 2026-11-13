@@ -1,5 +1,7 @@
 # Plan: ACP v2 (draft) adoption + pi-mcp-adapter auto-configuration
 
+> **Superseded.** MCP forwarding shipped through pi's native MCP support (`PI_ACP_MCP_SERVERS`, see the README), and the repo now pins `@agentclientprotocol/sdk` 2.6.0 rather than 0.26.0. Kept as the design record for the v2 router work.
+
 Status: proposal (plan only — no code yet).
 Scope decisions: **MCP config-file auto-write now (v1)**; **v2 built behind the dual-version router but
 held until v2 graduates from experimental to a published non-experimental SDK release**;

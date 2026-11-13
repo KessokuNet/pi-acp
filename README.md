@@ -95,17 +95,17 @@ npm install -g @earendil-works/pi-coding-agent
 
 #### Using ACP Registry in Zed or other clients that support it
 
-In Zed launch the registry with `zed: acp registry` command and select `pi ACP` adapter from the list. This will automatically add the agent server configuration to your `settings.json` and keep it up to date:
+In Zed launch the registry with `zed: acp registry` and pick the `pi ACP` entry. The registry tracks the upstream project (`svkozak/pi-acp`), not this fork, and this fork is not published to npm, so the registry gives you upstream code. Install from git or source below to run this fork.
 
 ```json
   "agent_servers": {
     "pi-acp": {
-      "type": "registry",
-    },
+      "type": "registry"
+    }
   }
 ```
 
-#### Using with `npx` (no global install needed, always loads the latest version)
+#### Using with `npx` (no global install needed, always builds the latest commit)
 
 Add the following to your Zed `settings.json`:
 
@@ -114,16 +114,18 @@ Add the following to your Zed `settings.json`:
     "pi": {
       "type": "custom",
       "command": "npx",
-      "args": ["-y", "@geohar/pi-acp"],
+      "args": ["-y", "github:KessokuNet/pi-acp"],
       "env": {}
     }
   }
 ```
 
+npx clones the repository and runs its `prepare` script, which builds `dist/` with tsup before the adapter starts.
+
 #### Global install
 
 ```bash
-npm install -g @geohar/pi-acp
+npm install -g github:KessokuNet/pi-acp
 ```
 
 ```json
@@ -199,8 +201,8 @@ Loaded from:
 - `/name <name>` – set session display name
 - `/queue all|one-at-a-time` – set pi queue mode (unstable feature)
 - `/changelog` – print the installed pi changelog (best-effort)
-- `/steering` - maps to `pi` Steering Mode, get/set
-- `/follow-up` - pats to `pi` Follow-up Mode, get/set
+- `/steering` – get/set pi's steering mode
+- `/follow-up` – get/set pi's follow-up mode
 
 Other built-in commands:
 
@@ -234,7 +236,7 @@ No configuration — it just works once the two packages are installed:
 
 ```bash
 pi install npm:@tintinweb/pi-subagents
-pi install npm:@geohar/pi-acp   # loads the pi.extensions entry (the bridge)
+pi install /path/to/pi-acp   # loads the pi.extensions entry (the bridge)
 ```
 
 The adapter marks the pi process it spawns with `PI_ACP=1`, which activates the bundled extension
@@ -278,6 +280,7 @@ Project layout:
 - No ACP terminal delegation (`terminal/*`). pi executes commands locally and the adapter only
   mirrors their output as a display-only terminal.
 - No ACP permission gating (`session/request_permission`): pi executes tools locally and does not surface pre-execution tool intents over RPC, so the adapter cannot gate them yet. Permission requests are only used to render pi extension `confirm` prompts, plus `select` prompts for clients without elicitation support.
+- Additional workspace roots are not a hard filesystem boundary: pi can operate outside them. They are communicated to the model (workspace awareness), not enforced as a sandbox.
 
 ## MCP servers
 
@@ -317,11 +320,6 @@ create `~/.pi/pi-acp/mcp-policy.json` (under `PI_ACP_DATA_DIR`):
 Names are case-insensitive. Note the ACP MCP shape has no dedicated auth field, so bearer auth can
 only travel as an HTTP header — either provided by the client in the server's `headers`, or added via
 this policy's `auth`.
-
-- Additional workspace roots are not a hard filesystem boundary: pi can operate outside them. They are communicated to the model (workspace awareness), not enforced as a sandbox.
-- Assistant streaming is currently sent as `agent_message_chunk` (no separate thought stream).
-- Queue is implemented client-side and should work like pi's `one-at-a-time`
-- ~~ACP clients don't yet suport session history, but ACP sessions from `pi-acp` can be `/resume`d in pi directly~~
 
 ## License
 

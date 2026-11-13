@@ -1,5 +1,7 @@
 # Bug: generated `.pi/mcp.json` silently disables bearer auth on an existing MCP server (→ 401)
 
+> **Fixed.** The generated-config writer is gone; MCP servers now reach pi through `PI_ACP_MCP_SERVERS` and the bundled extension, and any file still marked `_generatedBy: pi-acp` is deleted on startup. Kept as the incident record.
+
 **Status:** confirmed, root cause proven with a runtime trace.
 **Component:** pi-acp `writeMcpConfig` / `translateMcpServers` (`src/**`, built into `dist/index.js`).
 **Severity:** high — breaks a working, auth-protected MCP server for **all** pi sessions
@@ -14,15 +16,19 @@ A user runs an MCP server (`mcp-combiner`) locally with **inbound bearer auth en
 `~/.config/mcp/mcp.json`:
 
 ```json
-{ "mcpServers": { "mcp-combiner": {
-  "url": "http://127.0.0.1:9741/mcp",
-  "auth": "bearer",
-  "bearerTokenEnv": "MCP_COMBINER_AUTH_TOKEN"
-} } }
+{
+  "mcpServers": {
+    "mcp-combiner": {
+      "url": "http://127.0.0.1:9741/mcp",
+      "auth": "bearer",
+      "bearerTokenEnv": "MCP_COMBINER_AUTH_TOKEN"
+    }
+  }
+}
 ```
 
 After using pi through an ACP client, the server starts returning **HTTP 401** on connect.
-Agents narrate *"the mcp-combiner server isn't connected, let me connect to it…"* and MCP
+Agents narrate _"the mcp-combiner server isn't connected, let me connect to it…"_ and MCP
 tools are unusable. The failure then persists into **plain `pi` shell sessions that never
 touched ACP.**
 
@@ -43,8 +49,8 @@ touched ACP.**
 ```
 
 Note it carries **`url` + `headers` only** — no `auth`, no `bearerTokenEnv`. This is faithful
-to what `translateMcpServers` can express (below); it is not a translation *mistake* so much
-as a translation *gap* with a dangerous interaction downstream.
+to what `translateMcpServers` can express (below); it is not a translation _mistake_ so much
+as a translation _gap_ with a dangerous interaction downstream.
 
 ## Runtime proof
 
@@ -52,8 +58,15 @@ With `pi-mcp-adapter` tracing on, the combiner `initialize` fails **instantly** 
 timeout — an auth reject):
 
 ```json
-{"server":"mcp-combiner","transport":"streamable-http","kind":"request",
- "status":"error","method":"initialize","id":0,"durationMs":3.6}
+{
+  "server": "mcp-combiner",
+  "transport": "streamable-http",
+  "kind": "request",
+  "status": "error",
+  "method": "initialize",
+  "id": 0,
+  "durationMs": 3.6
+}
 ```
 
 (`~/.pi/mcp-traces/mcp-*.jsonl`)
@@ -107,32 +120,31 @@ file becomes the **highest-precedence** source and overrides the user's global e
 
 > This is why it affects non-ACP shell sessions: `~/.pi/mcp.json` is not tied to ACP. It is a
 > normal project-pi override that **any** pi session launched from `$HOME` reads. The
-> `_generatedBy: "pi-acp"` marker only gates whether pi-acp will *rewrite/clean* the file — it
-> does nothing to stop pi-mcp-adapter from *reading* it.
+> `_generatedBy: "pi-acp"` marker only gates whether pi-acp will _rewrite/clean_ the file — it
+> does nothing to stop pi-mcp-adapter from _reading_ it.
 
 ### 3. The URL change triggers pi-mcp-adapter's (correct) credential-stripping
 
 `mergeServerMaps` (`config.ts:481-534`) merges **per field**, and deliberately **binds auth
 material to the URL that supplied it**. When a higher-precedence source repoints an existing
-server at a *different* URL, it deletes the URL-bound fields from the inherited entry to avoid
+server at a _different_ URL, it deletes the URL-bound fields from the inherited entry to avoid
 shipping the original endpoint's credentials to a new URL:
 
 ```js
-const URL_BOUND_AUTH_FIELDS =
-  ["headers", "bearerToken", "bearerTokenEnv", "bearerTokenStore", "requestHeadersCommand"];
+const URL_BOUND_AUTH_FIELDS = ['headers', 'bearerToken', 'bearerTokenEnv', 'bearerTokenStore', 'requestHeadersCommand']
 // … when definition.url !== existing.url: delete each URL_BOUND_AUTH_FIELD from baseEntry
 ```
 
 So merging global (`/mcp`, with `bearerTokenEnv`) under the pi-acp override (`/mcp/<token>`)
 produces:
 
-| field           | source                    | in merged entry?                    |
-|-----------------|---------------------------|-------------------------------------|
-| `url`           | pi-acp                    | `…/mcp/<token>`                     |
-| `headers`       | pi-acp                    | `{X-MCP-Combiner-Session: …}`       |
-| `auth: "bearer"`| global (not URL-bound)    | **inherited — kept**                |
-| `bearerTokenEnv`| global (URL-bound)        | **STRIPPED (url changed)**          |
-| `trace: true`   | global (not URL-bound)    | **inherited — kept** (explains the traces) |
+| field            | source                 | in merged entry?                           |
+| ---------------- | ---------------------- | ------------------------------------------ |
+| `url`            | pi-acp                 | `…/mcp/<token>`                            |
+| `headers`        | pi-acp                 | `{X-MCP-Combiner-Session: …}`              |
+| `auth: "bearer"` | global (not URL-bound) | **inherited — kept**                       |
+| `bearerTokenEnv` | global (URL-bound)     | **STRIPPED (url changed)**                 |
+| `trace: true`    | global (not URL-bound) | **inherited — kept** (explains the traces) |
 
 ### 4. Connect: `auth:"bearer"` with no token → no header → 401
 
@@ -149,7 +161,7 @@ No `Authorization` header is sent. The combiner's stateless bearer check
 (`hmac.compare_digest`, no `WWW-Authenticate`) returns a plain **401**. Because `auth:"bearer"`
 survived, `supportsOAuth()` is false, so it's an honest 401 rather than an OAuth/DCR probe —
 the adapter does not recover, and the failure is cached behind a 60s backoff, so retries within
-the window just repeat *"not connected."*
+the window just repeat _"not connected."_
 
 **Net:** pi-acp's generated override, by repointing the URL and omitting the auth wiring, trips
 pi-mcp-adapter's anti-credential-exfiltration stripping, which silently disables bearer auth on
@@ -170,7 +182,7 @@ a server the user had configured correctly — for every `$HOME`-cwd pi session,
 
 ## Why it's easy to miss
 
-- Silent: no error at write time; the adapter's stripping is *by design*.
+- Silent: no error at write time; the adapter's stripping is _by design_.
 - Persistent: the file survives the ACP session and poisons unrelated shell sessions.
 - Misattributed: surfaces first in a subagent's fresh connect, so it reads as a "subagents
   don't get MCP" problem when it is actually a global config-precedence + auth-stripping problem.
@@ -186,13 +198,13 @@ Ordered by preference:
    and pi-acp writes those verbatim. The upstream omission was located: the nvim client's ACP
    spec builder — `mcp-companion`'s `lua/mcp_companion/cc/init.lua` `build_combiner_entry`
    (the source of `codecompanion.mcp.transform_to_acp`) — set only `X-MCP-Combiner-Session` and
-   no `Authorization`, even though the nvim host's *direct* combiner client already presents the
+   no `Authorization`, even though the nvim host's _direct_ combiner client already presents the
    bearer (`lua/mcp_companion/combiner/client.lua:311-313`). **Fixed** by adding a literal
    `{ name = "Authorization", value = "Bearer " .. MCP_COMBINER_AUTH_TOKEN }` to the HTTP
    entry's headers when `MCP_COMBINER_AUTH_TOKEN` is set (else no header — the combiner is open).
-   Being the override's *own* header, it survives pi-mcp-adapter's URL-bound stripping and
+   Being the override's _own_ header, it survives pi-mcp-adapter's URL-bound stripping and
    reaches the combiner.
-   - *Disk-safe variant (not used):* `pi-mcp-adapter` interpolates `$env:` inside header values
+   - _Disk-safe variant (not used):_ `pi-mcp-adapter` interpolates `$env:` inside header values
      at connect (`utils.ts:74` `interpolateEnvVars` supports `${VAR}`, `$env:VAR`, `{env:VAR}`),
      so `"Bearer $env:MCP_COMBINER_AUTH_TOKEN"` would keep the token off disk — but it is
      pi-specific (other ACP agents forward the literal string), so the client sends the literal
