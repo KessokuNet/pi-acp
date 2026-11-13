@@ -32,7 +32,6 @@ import { getToolPath, toToolCallLocations } from './translate/tool-args.js'
 
 export { toToolCallLocations }
 import { getPiAcpDebug } from './pi-acp-settings.js'
-import { getRetryEnabled } from './pi-settings.js'
 import {
   SUBAGENT_PLAN_CUSTOM_TYPE,
   SUBAGENT_RECORD_CUSTOM_TYPE,
@@ -333,12 +332,6 @@ export class PiAcpSession {
   readonly additionalDirectories: string[]
   private readonly clientCapabilities?: ClientCapabilities
 
-  /**
-   * pi has no RPC read for auto-retry, so the adapter mirrors the setting it started with and
-   * tracks what it last told pi. Reported to the client as the `auto_retry` config option.
-   */
-  autoRetryEnabled: boolean
-
   private startupInfo: string | null = null
   private startupInfoSent = false
 
@@ -405,7 +398,6 @@ export class PiAcpSession {
     this.conn = opts.conn
     this.fileCommands = opts.fileCommands ?? []
     this.clientCapabilities = opts.clientCapabilities
-    this.autoRetryEnabled = getRetryEnabled(this.cwd)
     this.subagents = new SubagentSessions({
       parentSessionId: this.sessionId,
       cwd: this.cwd,

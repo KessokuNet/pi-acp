@@ -99,8 +99,6 @@ type AdvertisedModel = {
 
 const MODEL_CONFIG_ID = 'model'
 const THOUGHT_LEVEL_CONFIG_ID = 'thought_level'
-const AUTO_COMPACTION_CONFIG_ID = 'auto_compaction'
-const AUTO_RETRY_CONFIG_ID = 'auto_retry'
 
 function builtinAvailableCommands(): AvailableCommand[] {
   return [
@@ -433,14 +431,10 @@ export class PiAcpAgent {
       )
     }
 
-    const { configOptions, models, modes } = await getSessionConfiguration(
-      session.proc,
-      {
-        state,
-        availableModels
-      },
-      { clientCapabilities: this.clientCapabilities, autoRetryEnabled: session.autoRetryEnabled }
-    )
+    const { configOptions, models, modes } = await getSessionConfiguration(session.proc, {
+      state,
+      availableModels
+    })
 
     const quietStartup = getQuietStartup(params.cwd)
     const updateNotice = buildUpdateNotice()
@@ -1221,10 +1215,7 @@ export class PiAcpAgent {
       }
     }
 
-    const { configOptions, models, modes } = await getSessionConfiguration(proc, undefined, {
-      clientCapabilities: this.clientCapabilities,
-      autoRetryEnabled: session.autoRetryEnabled
-    })
+    const { configOptions, models, modes } = await getSessionConfiguration(proc)
 
     const response = {
       configOptions,
@@ -1330,10 +1321,7 @@ export class PiAcpAgent {
 
     ;(this.sessions as any).closeAllExcept?.(session.sessionId, preexistingSessionIds)
 
-    const { configOptions, modes } = await getSessionConfiguration(proc, undefined, {
-      clientCapabilities: this.clientCapabilities,
-      autoRetryEnabled: session.autoRetryEnabled
-    })
+    const { configOptions, modes } = await getSessionConfiguration(proc)
 
     // Advertise slash commands after the response so the client knows the session exists.
     setTimeout(() => {
@@ -1431,16 +1419,7 @@ export class PiAcpAgent {
     const session = await this.restoreSession(params.sessionId)
     const configId = String(params.configId)
 
-    if (typeof params.value === 'boolean') {
-      if (configId === AUTO_COMPACTION_CONFIG_ID) {
-        await session.proc.setAutoCompaction(params.value)
-      } else if (configId === AUTO_RETRY_CONFIG_ID) {
-        await session.proc.setAutoRetry(params.value)
-        session.autoRetryEnabled = params.value
-      } else {
-        throw RequestError.invalidParams(undefined, `Config option does not take a boolean: ${configId}`)
-      }
-    } else if (typeof params.value === 'string') {
+    if (typeof params.value === 'string') {
       if (configId === MODEL_CONFIG_ID) {
         await setSessionModel(session.proc, params.value)
         this.publishContextUsage(session)
@@ -1465,10 +1444,7 @@ export class PiAcpAgent {
       throw RequestError.invalidParams(undefined, `Unsupported value for config option: ${configId}`)
     }
 
-    const configOptions = await emitConfigOptionsUpdate(this.conn, session.sessionId, session.proc, {
-      clientCapabilities: this.clientCapabilities,
-      autoRetryEnabled: session.autoRetryEnabled
-    })
+    const configOptions = await emitConfigOptionsUpdate(this.conn, session.sessionId, session.proc)
     return { configOptions }
   }
 }
@@ -1521,25 +1497,9 @@ async function getThinkingState(
   }
 }
 
-/** Booleans the client was told about; only built when it advertised boolean config options. */
-type BooleanConfigOptions = {
-  autoCompaction?: boolean
-  autoRetry: boolean
-}
-
-type ConfigOptionContext = {
-  clientCapabilities?: ClientCapabilities
-  autoRetryEnabled?: boolean
-}
-
-function supportsBooleanConfigOptions(context?: ConfigOptionContext): boolean {
-  return context?.clientCapabilities?.session?.configOptions?.boolean != null
-}
-
 async function getSessionConfiguration(
   proc: PiRpcProcess,
-  pre?: { state?: any | null; availableModels?: any | null },
-  context?: ConfigOptionContext
+  pre?: { state?: any | null; availableModels?: any | null }
 ): Promise<{
   configOptions: SessionConfigOption[]
   models: {
@@ -1555,12 +1515,7 @@ async function getSessionConfiguration(
     currentModeId: string
   }
 }> {
-  const wantsBooleans = supportsBooleanConfigOptions(context)
-  let state = pre?.state ?? null
-
-  if (wantsBooleans && state === null) {
-    state = (await proc.getState().catch(() => null)) as any
-  }
+  const state = pre?.state ?? null
 
   const [models, modes] = await Promise.all([
     getModelState(proc, { state, availableModels: pre?.availableModels }),
@@ -1568,37 +1523,26 @@ async function getSessionConfiguration(
   ])
 
   return {
-    configOptions: buildConfigOptions({ models, modes }, wantsBooleans ? booleanOptions(state, context) : undefined),
+    configOptions: buildConfigOptions({ models, modes }),
     models,
     modes
   }
 }
 
-/** pi reports auto-compaction but not auto-retry, so the retry value is the adapter's mirror. */
-function booleanOptions(state: any | null, context?: ConfigOptionContext): BooleanConfigOptions {
-  const booleans: BooleanConfigOptions = { autoRetry: context?.autoRetryEnabled ?? true }
-  const autoCompaction = state?.autoCompactionEnabled
-  if (typeof autoCompaction === 'boolean') booleans.autoCompaction = autoCompaction
-  return booleans
-}
-
-function buildConfigOptions(
-  state: {
-    models: {
-      availableModels: AdvertisedModel[]
-      currentModelId: string
-    } | null
-    modes: {
-      availableModes: Array<{
-        id: string
-        name: string
-        description?: string | null
-      }>
-      currentModeId: string
-    }
-  },
-  booleans?: BooleanConfigOptions
-): SessionConfigOption[] {
+function buildConfigOptions(state: {
+  models: {
+    availableModels: AdvertisedModel[]
+    currentModelId: string
+  } | null
+  modes: {
+    availableModes: Array<{
+      id: string
+      name: string
+      description?: string | null
+    }>
+    currentModeId: string
+  }
+}): SessionConfigOption[] {
   const configOptions: SessionConfigOption[] = [
     {
       type: 'select',
@@ -1628,26 +1572,6 @@ function buildConfigOptions(
         name: model.name,
         description: model.description ?? null
       }))
-    })
-  }
-
-  if (typeof booleans?.autoCompaction === 'boolean') {
-    configOptions.push({
-      type: 'boolean',
-      id: AUTO_COMPACTION_CONFIG_ID,
-      name: 'Auto-compaction',
-      description: 'Compact the context automatically when it approaches the model limit',
-      currentValue: booleans.autoCompaction
-    })
-  }
-
-  if (booleans) {
-    configOptions.push({
-      type: 'boolean',
-      id: AUTO_RETRY_CONFIG_ID,
-      name: 'Auto-retry',
-      description: 'Retry a failed model request automatically',
-      currentValue: booleans.autoRetry
     })
   }
 
@@ -1724,10 +1648,9 @@ async function getModelState(
 async function emitConfigOptionsUpdate(
   conn: AcpClientConnection,
   sessionId: string,
-  proc: PiRpcProcess,
-  context?: ConfigOptionContext
+  proc: PiRpcProcess
 ): Promise<SessionConfigOption[]> {
-  const { configOptions } = await getSessionConfiguration(proc, undefined, context)
+  const { configOptions } = await getSessionConfiguration(proc)
 
   await conn.sessionUpdate({
     sessionId,

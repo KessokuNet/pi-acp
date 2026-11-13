@@ -49,7 +49,6 @@ On top of upstream it adds:
   - `usage_update` reports context usage (`used`/`size`) and pi's cumulative session cost (`cost.amount`, in USD)
 - Configuration options
   - Model and thinking level are exposed as ACP `select` config options
-  - When the client advertises `session.config_options.boolean`, auto-compaction and auto-retry are exposed as ACP boolean config options too
 - Extension UI
   - Notifications from pi extensions become ACP `notice` updates when the client advertises `session.notices`, and stay as assistant text otherwise. Both carry `_meta.piAcp.notify.level`
   - `input` and `editor` extension requests are collected through `elicitation/create` (form mode) when the client advertises elicitation, and are cancelled with a visible note otherwise
