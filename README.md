@@ -43,9 +43,27 @@ On top of upstream it adds:
   - Relative file paths from pi are resolved against the session cwd before being emitted as ACP tool locations, which enables follow-along features in clients like Zed
   - For `edit`, `pi-acp` attempts to infer a 1-based line number from a unique `oldText` match in the pre-edit file snapshot and includes it in the emitted tool location when possible
   - For `edit`, `pi-acp` snapshots the file before the tool runs and emits an ACP **structured diff** (`oldText`/`newText`) on completion when possible
+  - When the client advertises `fs.read_text_file`, that pre-edit snapshot comes from the client's editor buffer, so a diff reflects unsaved changes instead of what is on disk
+  - Tool results are forwarded as ACP content blocks, including images (pi's `read` can return a screenshot)
+- Usage and cost
+  - `usage_update` reports context usage (`used`/`size`) and pi's cumulative session cost (`cost.amount`, in USD)
+- Configuration options
+  - Model and thinking level are exposed as ACP `select` config options
+  - When the client advertises `session.config_options.boolean`, auto-compaction and auto-retry are exposed as ACP boolean config options too
+- Extension UI
+  - Notifications from pi extensions become ACP `notice` updates when the client advertises `session.notices`, and stay as assistant text otherwise. Both carry `_meta.piAcp.notify.level`
+  - `input` and `editor` extension requests are collected through `elicitation/create` (form mode) when the client advertises elicitation, and are cancelled with a visible note otherwise
+  - `setTitle` extension requests are relayed as a `session_info_update`
 - Session persistence
   - pi stores its own sessions in `~/.pi/agent/sessions/...`
   - `pi-acp` stores a small mapping file at `~/.pi/pi-acp/session-map.json` so `session/load` can reattach to a previous pi session file
+  - A restored thread replays the stored conversation: user messages, assistant text and thinking, and every tool call with its input and output. pi splits a call across two messages (the assistant message holds the tool's arguments, the `toolResult` holds its output), so `pi-acp` pairs them by tool-call id
+  - Historic bash calls replay as text cards (command as the title, output plus a non-zero exit code as the body). A restored call's terminal belonged to the connection that died, so replaying the terminal `_meta` channel would render an empty card
+- Prompt queueing and steering
+  - A `session/prompt` sent while a turn is running is handed straight to pi with `streamingBehavior: "followUp"`, so it waits for the running turn and then runs, inside the same ACP turn. If pi refuses the prompt (e.g. while compacting), `pi-acp` holds it locally and starts it after the turn settles
+  - `session/cancel` aborts the turn and clears pi's queue
+  - `_session/steering` is supported as an extension method (matching claude-code-acp's convention, advertised as `_meta.steering.supported`): a client can inject a message into the running turn (`{"outcome":"injected"}`), be told to send a normal prompt instead (`{"outcome":"promptRequired"}`, when it passes `_meta.steering.idleBehavior: "promptRequired"`), or have a turn started for it (`{"outcome":"startedNewTurn"}`)
+  - `_meta.piAcp.queueDepth` (and `queued.steering`/`queued.followUp` counts) is published from pi's own `queue_update`
 - Multi-workspace support (`sessionCapabilities.additionalDirectories`)
   - ACP clients can pass additional workspace roots on `session/new` / `session/load` (e.g. Zed multi-root workspaces)
   - `cwd` stays the primary working directory; the additional roots are communicated to pi via `--append-system-prompt`, since pi has no native multi-root workspace concept
@@ -253,8 +271,11 @@ Project layout:
 
 ## Limitations
 
-- No ACP filesystem delegation (`fs/*`) and no ACP terminal delegation (`terminal/*`). pi reads/writes and executes locally.
-- No ACP permission gating (`session/request_permission`): pi executes tools locally and does not surface pre-execution tool intents over RPC, so the adapter cannot gate them yet.
+- ACP filesystem delegation is read-only: `fs/read_text_file` is used to snapshot a file from the
+  client's buffer before an edit, but writes still go through pi directly.
+- No ACP terminal delegation (`terminal/*`). pi executes commands locally and the adapter only
+  mirrors their output as a display-only terminal.
+- No ACP permission gating (`session/request_permission`): pi executes tools locally and does not surface pre-execution tool intents over RPC, so the adapter cannot gate them yet. Permission requests are only used to render pi extension `select`/`confirm` prompts.
 
 ## MCP servers
 

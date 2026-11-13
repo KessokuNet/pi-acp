@@ -60,6 +60,8 @@ type Child = {
   title?: string
   description?: string
   status?: string
+  /** Failure detail from pi-subagents, surfaced to the client as the stop reason's error. */
+  error?: string
   announced: boolean
   offset: number
   partialLine: string
@@ -79,9 +81,18 @@ export type SubagentSessionsOptions = {
 
 const DONE = new Set(['completed', 'failed', 'error', 'aborted', 'stopped', 'cancelled'])
 
-function idleState(status: string | undefined): StateUpdate {
+/** JSON-RPC error code for a failure pi did not classify; clients only read `message`. */
+const SUBAGENT_ERROR_CODE = -32603
+
+function idleState(status: string | undefined, error?: string): StateUpdate {
   if (status === 'completed') return { state: 'idle', stopReason: 'end_turn' }
-  if (status === 'failed' || status === 'error') return { state: 'idle', stopReason: 'error' }
+  if (status === 'failed' || status === 'error') {
+    return {
+      state: 'idle',
+      stopReason: 'error',
+      ...(error ? { error: { code: SUBAGENT_ERROR_CODE, message: error } } : {})
+    }
+  }
   return { state: 'idle', stopReason: 'cancelled' }
 }
 
@@ -122,6 +133,7 @@ export class SubagentSessions {
     if (agent.type) child.description = agent.type
     const previous = child.status
     if (agent.status) child.status = agent.status
+    if (agent.error) child.error = agent.error
 
     if (!child.toolCallId) {
       const call = this.takePendingCall(agent.description)
@@ -191,7 +203,7 @@ export class SubagentSessions {
       title: child.title ?? child.agentId,
       description: child.description ?? null,
       cwd: this.opts.cwd,
-      state: child.status && DONE.has(child.status) ? idleState(child.status) : { state: 'running' }
+      state: child.status && DONE.has(child.status) ? idleState(child.status, child.error) : { state: 'running' }
     })
   }
 
@@ -199,7 +211,7 @@ export class SubagentSessions {
     this.opts.emit(this.opts.parentSessionId, {
       sessionUpdate: 'subagent_update',
       sessionId: childSessionId(child.agentId),
-      state: child.status && DONE.has(child.status) ? idleState(child.status) : { state: 'running' }
+      state: child.status && DONE.has(child.status) ? idleState(child.status, child.error) : { state: 'running' }
     })
   }
 

@@ -27,8 +27,12 @@ import {
   bashTerminalOutputMeta,
   isBashTool
 } from './translate/bash.js'
-import { toToolKind, toolResultToText } from './translate/pi-tools.js'
+import { toToolKind, toolResultContent, toolResultToText } from './translate/pi-tools.js'
+import { getToolPath, toToolCallLocations } from './translate/tool-args.js'
+
+export { toToolCallLocations }
 import { getPiAcpDebug } from './pi-acp-settings.js'
+import { getRetryEnabled } from './pi-settings.js'
 import {
   SUBAGENT_PLAN_CUSTOM_TYPE,
   SUBAGENT_RECORD_CUSTOM_TYPE,
@@ -83,6 +87,9 @@ type QueuedTurn = {
   reject: (err: unknown) => void
 }
 
+/** Pre-mutation file contents for a tool call; `pendingOldText` is the client's (buffer-aware) copy. */
+type FileSnapshot = { path: string; oldText: string | null; pendingOldText?: Promise<string | null> }
+
 type PermissionResponse = Awaited<ReturnType<AcpClientConnection['requestPermission']>>
 
 const CONFIRM_PERMISSION_OPTIONS: PermissionOption[] = [
@@ -92,6 +99,9 @@ const CONFIRM_PERMISSION_OPTIONS: PermissionOption[] = [
 const EXTENSION_UI_RAW_INPUT_KEYS = ['title', 'message', 'options', 'placeholder', 'prefill'] as const
 const CHOICE_OPTION_PREFIX = 'choice-'
 const SESSION_STATS_TIMEOUT_MS = 5_000
+
+/** pi prices every model in US dollars; the ACP cost field wants an ISO 4217 unit. */
+const COST_CURRENCY = 'USD'
 
 /**
  * Map pi's `stats.contextUsage` to an ACP `usage_update`. Returns null when pi reports no
@@ -106,7 +116,15 @@ export function toUsageUpdate(stats: unknown): SessionUpdate | null {
   if (typeof used !== 'number' || !Number.isSafeInteger(used) || used < 0) return null
   if (typeof size !== 'number' || !Number.isSafeInteger(size) || size <= 0) return null
 
-  return { sessionUpdate: 'usage_update', used, size }
+  const cost = (stats as { cost?: unknown } | null | undefined)?.cost
+  const priced = typeof cost === 'number' && Number.isFinite(cost) && cost >= 0
+
+  return {
+    sessionUpdate: 'usage_update',
+    used,
+    size,
+    ...(priced ? { cost: { amount: cost, currency: COST_CURRENCY } } : {})
+  }
 }
 
 function findUniqueLineNumber(text: string, needle: string): number | undefined {
@@ -123,13 +141,6 @@ function findUniqueLineNumber(text: string, needle: string): number | undefined 
     if (text.charCodeAt(i) === 10) line += 1
   }
   return line
-}
-
-function getToolPath(args: unknown): string | undefined {
-  const record = args as { path?: unknown; file_path?: unknown } | null | undefined
-  if (typeof record?.path === 'string') return record.path
-  if (typeof record?.file_path === 'string') return record.file_path
-  return undefined
 }
 
 // Match pi's current edit schema: { path, edits: [{ oldText, newText }] }, with
@@ -187,14 +198,6 @@ function getEditOldTexts(args: unknown): string[] {
   }
 
   return oldTexts
-}
-
-function toToolCallLocations(args: unknown, cwd: string, line?: number): ToolCallLocation[] | undefined {
-  const path = getToolPath(args)
-  if (!path) return undefined
-
-  const resolvedPath = isAbsolute(path) ? path : resolvePath(cwd, path)
-  return [{ path: resolvedPath, ...(typeof line === 'number' ? { line } : {}) }]
 }
 
 export class SessionManager {
@@ -295,7 +298,7 @@ export class SessionManager {
 
   get(sessionId: string): PiAcpSession {
     const s = this.sessions.get(sessionId)
-    if (!s) throw RequestError.invalidParams(`Unknown sessionId: ${sessionId}`)
+    if (!s) throw RequestError.invalidParams(undefined, `Unknown sessionId: ${sessionId}`)
     return s
   }
 
@@ -330,6 +333,12 @@ export class PiAcpSession {
   readonly additionalDirectories: string[]
   private readonly clientCapabilities?: ClientCapabilities
 
+  /**
+   * pi has no RPC read for auto-retry, so the adapter mirrors the setting it started with and
+   * tracks what it last told pi. Reported to the client as the `auto_retry` config option.
+   */
+  autoRetryEnabled: boolean
+
   private startupInfo: string | null = null
   private startupInfoSent = false
 
@@ -344,6 +353,12 @@ export class PiAcpSession {
   // Current in-flight turn (if any). Additional prompts are queued.
   private pendingTurn: PendingTurn | null = null
   private readonly turnQueue: QueuedTurn[] = []
+  // Prompts already handed to pi (which queues them itself); they resolve with the running turn.
+  private readonly attachedPrompts: QueuedTurn[] = []
+  // Latest pi-reported queue, used for `_meta.piAcp.queueDepth`.
+  private piQueue: { steering: string[]; followUp: string[] } | null = null
+  // Set once pi's subprocess is gone: late prompt forwards must settle instead of starting a turn.
+  private procExited = false
   // Track tool call statuses and ensure they are monotonic (pending -> in_progress -> completed).
   // Some pi events can arrive out of order (e.g. late toolcall_* deltas after execution starts),
   // and clients may hide progress if we ever downgrade back to `pending`.
@@ -356,7 +371,7 @@ export class PiAcpSession {
   // For ACP diff support: capture file contents before edit/write mutations,
   // then emit ToolCallContent {type:"diff"}. Compatible structured edit/write
   // events may need to be implemented in pi in the future.
-  private fileSnapshots = new Map<string, { path: string; oldText: string | null }>()
+  private fileSnapshots = new Map<string, FileSnapshot>()
   private fileMutationToolCallIds = new Set<string>()
   private bashToolCallIds = new Set<string>()
   private bashOutputSnapshots = new Map<string, string>()
@@ -368,6 +383,9 @@ export class PiAcpSession {
   // Ensure `session/update` notifications are sent in order and can be awaited
   // before completing a `session/prompt` request.
   private lastEmit: Promise<void> = Promise.resolve()
+
+  // Tool results whose diff needs the client's async file read; awaited before a turn settles.
+  private readonly pendingResults = new Set<Promise<void>>()
 
   constructor(opts: {
     sessionId: string
@@ -387,6 +405,7 @@ export class PiAcpSession {
     this.conn = opts.conn
     this.fileCommands = opts.fileCommands ?? []
     this.clientCapabilities = opts.clientCapabilities
+    this.autoRetryEnabled = getRetryEnabled(this.cwd)
     this.subagents = new SubagentSessions({
       parentSessionId: this.sessionId,
       cwd: this.cwd,
@@ -403,15 +422,17 @@ export class PiAcpSession {
    * `agent_settled`, so settle them now instead of leaving the ACP `session/prompt` request hanging.
    */
   private handleProcExit(): void {
+    this.procExited = true
     const reason: StopReason = this.cancelRequested ? 'cancelled' : 'error'
     const pending = this.pendingTurn
+    const attached = this.attachedPrompts.splice(0, this.attachedPrompts.length)
     const queued = this.turnQueue.splice(0, this.turnQueue.length)
     this.pendingTurn = null
-    if (!pending && queued.length === 0) return
+    if (!pending && attached.length === 0 && queued.length === 0) return
 
     void this.flushEmits().finally(() => {
       pending?.resolve(reason)
-      for (const t of queued) t.resolve(reason)
+      for (const t of [...attached, ...queued]) t.resolve(reason)
     })
   }
 
@@ -442,27 +463,11 @@ export class PiAcpSession {
     const turnPromise = new Promise<StopReason>((resolve, reject) => {
       const queued: QueuedTurn = { message: expandedMessage, images, resolve, reject }
 
-      // If a turn is already running, enqueue.
+      // pi queues prompts itself, so hand the message over right away with a `followUp`
+      // disposition instead of holding it until `agent_settled`. The ACP request still stays
+      // open until the run settles, because pi delivers follow-ups inside the same run.
       if (this.pendingTurn) {
-        this.turnQueue.push(queued)
-
-        // Best-effort: notify client that a prompt was queued.
-        // This doesn't work in Zed yet, needs to be revisited
-        this.emit({
-          sessionUpdate: 'agent_message_chunk',
-          content: {
-            type: 'text',
-            text: `Queued message (position ${this.turnQueue.length}).`
-          }
-        })
-
-        // Also publish queue depth via session info metadata.
-        // This also not visible in the client
-        this.emit({
-          sessionUpdate: 'session_info_update',
-          _meta: { piAcp: { queueDepth: this.turnQueue.length, running: true } }
-        })
-
+        this.attachOrQueue(queued)
         return
       }
 
@@ -473,13 +478,45 @@ export class PiAcpSession {
     return turnPromise
   }
 
+  /**
+   * Inject a message into the running turn, mirroring claude-code-acp's `_session/steering`
+   * extension method. Steering only applies mid-turn; a client asking `promptRequired` while
+   * idle expects to send a normal prompt instead.
+   */
+  async steer(
+    message: string,
+    images: unknown[] = [],
+    opts: { idleBehavior?: 'promptRequired' } = {}
+  ): Promise<'injected' | 'promptRequired' | 'startedNewTurn'> {
+    const expandedMessage = expandSlashCommand(message, this.fileCommands)
+
+    if (this.pendingTurn) {
+      await this.proc.prompt(expandedMessage, images, 'steer')
+      // The client sent this outside `session/prompt`, so nothing has rendered it in the
+      // thread; echo it so the conversation shows what the running turn was steered with.
+      this.emit({
+        sessionUpdate: 'user_message_chunk',
+        content: { type: 'text', text: expandedMessage } satisfies ContentBlock
+      })
+      return 'injected'
+    }
+
+    if (opts.idleBehavior === 'promptRequired') return 'promptRequired'
+
+    // Idle and the client wants a turn started anyway: run it without an ACP request to resolve.
+    this.startTurn({ message: expandedMessage, images, resolve: () => {}, reject: () => {} })
+    return 'startedNewTurn'
+  }
+
   async cancel(): Promise<void> {
     // Cancel current and clear any queued prompts.
     this.cancelRequested = true
 
-    if (this.turnQueue.length) {
+    const attached = this.attachedPrompts.splice(0, this.attachedPrompts.length)
+
+    if (this.turnQueue.length || attached.length) {
       const queued = this.turnQueue.splice(0, this.turnQueue.length)
-      for (const t of queued) t.resolve('cancelled')
+      for (const t of [...attached, ...queued]) t.resolve('cancelled')
 
       this.emit({
         sessionUpdate: 'agent_message_chunk',
@@ -487,12 +524,15 @@ export class PiAcpSession {
       })
       this.emit({
         sessionUpdate: 'session_info_update',
-        _meta: { piAcp: { queueDepth: 0, running: Boolean(this.pendingTurn) } }
+        _meta: { piAcp: { queueDepth: this.queueDepth(), running: Boolean(this.pendingTurn) } }
       })
     }
 
     // Abort the currently running turn (if any). If nothing is running, this is a no-op.
     await this.proc.abort()
+
+    // pi holds the queued messages; drop them so an aborted turn does not run them later.
+    await this.proc.clearQueue().catch(() => {})
   }
 
   wasCancelRequested(): boolean {
@@ -532,6 +572,7 @@ export class PiAcpSession {
       // Usage is auxiliary.
     }
 
+    await Promise.allSettled([...this.pendingResults])
     await this.flushEmits()
   }
 
@@ -543,6 +584,16 @@ export class PiAcpSession {
    */
   private clientSupportsTerminal(): boolean {
     return this.clientCapabilities?.terminal === true
+  }
+
+  /** Whether the client can read workspace files (used for unsaved-buffer diffs). */
+  private clientSupportsFileRead(): boolean {
+    return this.clientCapabilities?.fs?.readTextFile === true
+  }
+
+  /** Whether the client can render an elicitation form, i.e. ask the user for free-form input. */
+  private clientSupportsElicitation(): boolean {
+    return this.clientCapabilities?.elicitation?.form != null
   }
 
   private emitBashToolCall(params: {
@@ -626,6 +677,137 @@ export class PiAcpSession {
     this.bashOutputSnapshots.delete(toolCallId)
   }
 
+  /**
+   * Final update for a finished tool call: a structured diff when pi edited a file, otherwise the
+   * result content (text and any image blocks pi returned).
+   */
+  private emitToolResult(
+    toolCallId: string,
+    result: unknown,
+    isError: boolean,
+    snapshot: FileSnapshot | undefined
+  ): void {
+    const content = this.toolResultContentFor(result, isError, snapshot)
+
+    this.emit({
+      sessionUpdate: 'tool_call_update',
+      toolCallId,
+      status: isError ? 'failed' : 'completed',
+      content,
+      ...(content?.some(entry => entry.type === 'diff') ? {} : { rawOutput: result })
+    })
+
+    this.cleanupToolCall(toolCallId)
+  }
+
+  /** Waits for the client's pre-edit copy, then emits the same final update as `emitToolResult`. */
+  private async emitFileToolResult(
+    toolCallId: string,
+    result: unknown,
+    isError: boolean,
+    snapshot: FileSnapshot
+  ): Promise<void> {
+    let oldText = snapshot.oldText
+
+    if (snapshot.pendingOldText) {
+      try {
+        const fromClient = await snapshot.pendingOldText
+        if (typeof fromClient === 'string') oldText = fromClient
+      } catch {
+        // Keep the disk copy captured at tool start.
+      }
+    }
+
+    this.emitToolResult(toolCallId, result, isError, { path: snapshot.path, oldText })
+  }
+
+  private toolResultContentFor(
+    result: unknown,
+    isError: boolean,
+    snapshot: FileSnapshot | undefined
+  ): ToolCallContent[] | undefined {
+    if (!isError && snapshot) {
+      try {
+        const abs = isAbsolute(snapshot.path) ? snapshot.path : resolvePath(this.cwd, snapshot.path)
+        const newText = readFileSync(abs, 'utf8')
+        if (snapshot.oldText === null || newText !== snapshot.oldText) {
+          return [
+            {
+              type: 'diff',
+              path: snapshot.path,
+              oldText: snapshot.oldText,
+              newText
+            }
+          ]
+        }
+      } catch {
+        // ignore; fall back to the tool result content
+      }
+    }
+
+    const content = toolResultContent(result)
+    return content.length ? content : undefined
+  }
+
+  /**
+   * Reads a workspace file through the client, so an unsaved editor buffer is the diff source
+   * rather than the last text on disk. Returns null when the client cannot read files.
+   */
+  private async readTextFileFromClient(path: string): Promise<string | null> {
+    if (!this.clientSupportsFileRead()) return null
+
+    try {
+      const abs = isAbsolute(path) ? path : resolvePath(this.cwd, path)
+      const res = await this.conn.readTextFile({ sessionId: this.sessionId, path: abs })
+      return typeof res.content === 'string' ? res.content : null
+    } catch {
+      return null
+    }
+  }
+
+  /** Hand a mid-turn prompt to pi, falling back to the local queue if pi refuses it (e.g. mid-compaction). */
+  private attachOrQueue(queued: QueuedTurn): void {
+    const settleIfDead = (): boolean => {
+      if (!this.procExited) return false
+      queued.resolve(this.cancelRequested ? 'cancelled' : 'error')
+      return true
+    }
+
+    this.proc.prompt(queued.message, queued.images, 'followUp').then(
+      () => {
+        if (settleIfDead()) return
+        if (this.pendingTurn) this.attachedPrompts.push(queued)
+        else this.startTurn(queued)
+      },
+      () => {
+        if (settleIfDead()) return
+        if (!this.pendingTurn) {
+          this.startTurn(queued)
+          return
+        }
+
+        this.turnQueue.push(queued)
+        this.emit({
+          sessionUpdate: 'agent_message_chunk',
+          content: {
+            type: 'text',
+            text: `Queued message (position ${this.queueDepth()}).`
+          }
+        })
+        this.emit({
+          sessionUpdate: 'session_info_update',
+          _meta: { piAcp: { queueDepth: this.queueDepth(), running: true } }
+        })
+      }
+    )
+  }
+
+  /** Messages pi is still holding, plus our own fallback queue when the forward failed. */
+  private queueDepth(): number {
+    if (!this.piQueue) return this.turnQueue.length
+    return this.piQueue.steering.length + this.piQueue.followUp.length + this.turnQueue.length
+  }
+
   private startTurn(t: QueuedTurn): void {
     this.cancelRequested = false
 
@@ -634,7 +816,7 @@ export class PiAcpSession {
     // Publish queue depth (0 because we're starting the turn now).
     this.emit({
       sessionUpdate: 'session_info_update',
-      _meta: { piAcp: { queueDepth: this.turnQueue.length, running: true } }
+      _meta: { piAcp: { queueDepth: this.queueDepth(), running: true } }
     })
 
     // Kick off pi, but completion is determined by pi events, not the RPC response.
@@ -659,7 +841,7 @@ export class PiAcpSession {
         // But we still clear the queueDepth metadata.
         this.emit({
           sessionUpdate: 'session_info_update',
-          _meta: { piAcp: { queueDepth: this.turnQueue.length, running: false } }
+          _meta: { piAcp: { queueDepth: this.queueDepth(), running: false } }
         })
       })
       void err
@@ -792,25 +974,30 @@ export class PiAcpSession {
 
         // Capture pre-mutation file contents so we can emit a structured ACP diff.
         const isFileMutation = toolName === 'edit' || toolName === 'write'
-        let snapshotOldText: string | null | undefined
         if (isFileMutation) {
           this.fileMutationToolCallIds.add(toolCallId)
           const p = getToolPath(args)
           if (p) {
+            let diskText: string | null = null
             try {
               const abs = isAbsolute(p) ? p : resolvePath(this.cwd, p)
-              snapshotOldText = readFileSync(abs, 'utf8')
-              this.fileSnapshots.set(toolCallId, { path: p, oldText: snapshotOldText })
-
-              if (toolName === 'edit') {
-                for (const needle of getEditOldTexts(args)) {
-                  line = findUniqueLineNumber(snapshotOldText, needle)
-                  if (typeof line === 'number') break
-                }
-              }
+              diskText = readFileSync(abs, 'utf8')
             } catch {
-              snapshotOldText = null
-              this.fileSnapshots.set(toolCallId, { path: p, oldText: null })
+              diskText = null
+            }
+
+            const pendingOldText = this.clientSupportsFileRead() ? this.readTextFileFromClient(p) : undefined
+            this.fileSnapshots.set(toolCallId, {
+              path: p,
+              oldText: diskText,
+              ...(pendingOldText ? { pendingOldText } : {})
+            })
+
+            if (typeof diskText === 'string' && toolName === 'edit') {
+              for (const needle of getEditOldTexts(args)) {
+                line = findUniqueLineNumber(diskText, needle)
+                if (typeof line === 'number') break
+              }
             }
           }
         }
@@ -900,45 +1087,16 @@ export class PiAcpSession {
           break
         }
 
-        const text = toolResultToText(result)
-
         const snapshot = this.fileSnapshots.get(toolCallId)
-        let content: ToolCallContent[] | undefined
-        let hasStructuredDiff = false
-
-        if (!isError && snapshot) {
-          try {
-            const abs = isAbsolute(snapshot.path) ? snapshot.path : resolvePath(this.cwd, snapshot.path)
-            const newText = readFileSync(abs, 'utf8')
-            if (snapshot.oldText === null || newText !== snapshot.oldText) {
-              hasStructuredDiff = true
-              content = [
-                {
-                  type: 'diff',
-                  path: snapshot.path,
-                  oldText: snapshot.oldText,
-                  newText
-                }
-              ]
-            }
-          } catch {
-            // ignore; fall back to text only
-          }
+        if (!isError && snapshot?.pendingOldText) {
+          // The client's copy of an unsaved buffer is the better diff source; it arrives async.
+          const pending = this.emitFileToolResult(toolCallId, result, isError, snapshot)
+          this.pendingResults.add(pending)
+          void pending.finally(() => this.pendingResults.delete(pending))
+          break
         }
 
-        if (!content && !hasStructuredDiff && text) {
-          content = [{ type: 'content', content: { type: 'text', text } }] satisfies ToolCallContent[]
-        }
-
-        this.emit({
-          sessionUpdate: 'tool_call_update',
-          toolCallId,
-          status: isError ? 'failed' : 'completed',
-          content,
-          ...(hasStructuredDiff ? {} : { rawOutput: result })
-        })
-
-        this.cleanupToolCall(toolCallId)
+        this.emitToolResult(toolCallId, result, isError, snapshot)
         break
       }
 
@@ -1025,12 +1183,33 @@ export class PiAcpSession {
         break
       }
 
+      case 'queue_update': {
+        const steering = Array.isArray((ev as any).steering) ? ((ev as any).steering as string[]) : []
+        const followUp = Array.isArray((ev as any).followUp) ? ((ev as any).followUp as string[]) : []
+        this.piQueue = { steering, followUp }
+        this.emit({
+          sessionUpdate: 'session_info_update',
+          _meta: {
+            piAcp: {
+              queueDepth: this.queueDepth(),
+              queued: { steering: steering.length, followUp: followUp.length },
+              running: Boolean(this.pendingTurn)
+            }
+          }
+        })
+        break
+      }
+
       case 'agent_settled': {
         // Publish usage and deliver all pending updates before resolving `session/prompt`.
         void this.publishContextUsage().finally(() => {
           const reason: StopReason = this.cancelRequested ? 'cancelled' : 'end_turn'
           this.pendingTurn?.resolve(reason)
           this.pendingTurn = null
+
+          // Prompts pi queued alongside the run settle with it.
+          const attached = this.attachedPrompts.splice(0, this.attachedPrompts.length)
+          for (const t of attached) t.resolve(reason)
 
           // Start next queued prompt, if any.
           const next = this.turnQueue.shift()
@@ -1043,7 +1222,7 @@ export class PiAcpSession {
           } else {
             this.emit({
               sessionUpdate: 'session_info_update',
-              _meta: { piAcp: { queueDepth: 0, running: false } }
+              _meta: { piAcp: { queueDepth: this.queueDepth(), running: false } }
             })
           }
         })
@@ -1072,29 +1251,107 @@ export class PiAcpSession {
       return
     }
 
+    if (method === 'setTitle') {
+      const title = stringProp(ev, 'title')
+      if (title) {
+        this.emit({
+          sessionUpdate: 'session_info_update',
+          title,
+          updatedAt: new Date().toISOString()
+        })
+      }
+      await this.proc.sendExtensionUiResponse({ id, cancelled: true })
+      return
+    }
+
     if (method === 'input' || method === 'editor') {
+      await this.handleExtensionInput(ev, id, method)
+      return
+    }
+
+    if (method === 'notify') {
+      const message = stringProp(ev, 'message') ?? 'Pi notification'
+      const level = stringProp(ev, 'notifyType') ?? 'info'
+
+      if (this.clientSupportsNotices()) {
+        this.emit({
+          sessionUpdate: 'notice',
+          severity: noticeSeverity(level),
+          title: message,
+          _meta: { piAcp: { notify: { level } } }
+        })
+      } else {
+        this.emit({
+          sessionUpdate: 'agent_message_chunk',
+          content: { type: 'text', text: message } satisfies ContentBlock,
+          _meta: { piAcp: { notify: { level } } }
+        })
+      }
+
+      await this.proc.sendExtensionUiResponse({ id, cancelled: true })
+      return
+    }
+
+    await this.proc.sendExtensionUiResponse({ id, cancelled: true })
+  }
+
+  /**
+   * pi's `input`/`editor` UI requests ask the user for free-form text. Clients that render an
+   * elicitation form get one; every other client keeps the previous cancel-with-a-note behaviour.
+   */
+  private async handleExtensionInput(ev: PiRpcEvent, id: string, method: string): Promise<void> {
+    if (!this.clientSupportsElicitation()) {
       this.emit({
         sessionUpdate: 'agent_message_chunk',
         content: {
           type: 'text',
-          text: `Pi ${method} UI request is not supported in ACP yet; cancelling it.`
+          text: `Pi ${method} UI request is not supported by this client; cancelling it.`
         } satisfies ContentBlock
       })
       await this.proc.sendExtensionUiResponse({ id, cancelled: true })
       return
     }
 
-    if (method === 'notify') {
-      this.emit({
-        sessionUpdate: 'agent_message_chunk',
-        content: { type: 'text', text: stringProp(ev, 'message') ?? 'Pi notification' } satisfies ContentBlock,
-        _meta: { piAcp: { notify: { level: stringProp(ev, 'notifyType') ?? 'info' } } }
+    const title = stringProp(ev, 'title') ?? `Pi ${method} request`
+    const placeholder = stringProp(ev, 'placeholder')
+    const prefill = stringProp(ev, 'prefill')
+
+    let accepted: { value?: unknown } | null = null
+    try {
+      const response = await this.conn.createElicitation({
+        sessionId: this.sessionId,
+        message: title,
+        mode: 'form',
+        requestedSchema: {
+          type: 'object',
+          title,
+          properties: {
+            value: {
+              type: 'string',
+              title,
+              ...(placeholder ? { description: placeholder } : {}),
+              ...(prefill ? { default: prefill } : {})
+            }
+          },
+          required: ['value']
+        }
       })
+
+      if (response.action === 'accept') {
+        accepted = response.content ?? null
+      }
+    } catch {
       await this.proc.sendExtensionUiResponse({ id, cancelled: true })
       return
     }
 
-    await this.proc.sendExtensionUiResponse({ id, cancelled: true })
+    const value = accepted?.value
+    if (typeof value !== 'string') {
+      await this.proc.sendExtensionUiResponse({ id, cancelled: true })
+      return
+    }
+
+    await this.proc.sendExtensionUiResponse({ id, value })
   }
 
   /**
@@ -1308,6 +1565,12 @@ function extensionUiToolCall(id: string, ev: PiRpcEvent) {
 function stringProp(source: Record<string, unknown>, key: string): string | null {
   const value = source[key]
   return typeof value === 'string' ? value : null
+}
+
+/** pi's notify levels are success/warning/error plus a catch-all info. */
+function noticeSeverity(level: string): 'info' | 'warning' | 'error' {
+  if (level === 'error' || level === 'warning') return level
+  return 'info'
 }
 
 function optionIndex(optionId: string): number | null {

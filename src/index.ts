@@ -1,5 +1,5 @@
 import { agent as agentApp, methods, ndJsonStream, type AgentConnection } from '@agentclientprotocol/sdk/unstable'
-import { PiAcpAgent } from './acp/agent.js'
+import { parseSteerParams, PiAcpAgent } from './acp/agent.js'
 import { clientConnection } from './acp/connection.js'
 import { getPiCommand, shouldUseShellForPiCommand } from './pi-rpc/command.js'
 import { getPiCommandOverride } from './acp/pi-acp-settings.js'
@@ -54,6 +54,8 @@ const stream = ndJsonStream(input, output)
 // The client context is read lazily: handlers and sessions only run after `connect()` returns.
 const piAgent = new PiAcpAgent(clientConnection(() => connection.client))
 
+const STEER_METHOD = '_session/steering'
+
 const agent = methods.agent
 const connection: AgentConnection = agentApp()
   .onRequest(agent.initialize, ({ params }) => piAgent.initialize(params))
@@ -69,6 +71,7 @@ const connection: AgentConnection = agentApp()
   .onRequest(agent.session.setMode, ({ params }) => piAgent.setSessionMode(params))
   .onRequest(agent.session.setConfigOption, ({ params }) => piAgent.setSessionConfigOption(params))
   .onRequest(agent.session.prompt, ({ params }) => piAgent.prompt(params))
+  .onRequest(STEER_METHOD, parseSteerParams, ({ params }) => piAgent.steerSession(params))
   .onNotification(agent.session.cancel, ({ params }) => piAgent.cancel(params))
   .connect(stream)
 

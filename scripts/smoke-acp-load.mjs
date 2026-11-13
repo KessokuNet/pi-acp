@@ -53,6 +53,11 @@ async function createAndPrompt() {
     let sessionId = null
 
     a.onMessage(msg => {
+      if (msg?.id === 1) {
+        a.send({ jsonrpc: '2.0', id: 2, method: 'session/new', params: { cwd: process.cwd(), mcpServers: [] } })
+        return
+      }
+
       if (msg?.id === 2 && msg?.result?.sessionId) {
         sessionId = msg.result.sessionId
         a.send({
@@ -73,7 +78,6 @@ async function createAndPrompt() {
     a.proc.on('error', reject)
 
     a.send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: 1 } })
-    a.send({ jsonrpc: '2.0', id: 2, method: 'session/new', params: { cwd: process.cwd(), mcpServers: [] } })
 
     // If the agent exits before we complete, fail.
     a.proc.on('exit', code => {
@@ -92,9 +96,19 @@ async function loadAndCountReplay(sessionId) {
     a.onMessage(msg => {
       if (msg?.method === 'session/update') updates++
 
+      if (msg?.id === 1) {
+        a.send({
+          jsonrpc: '2.0',
+          id: 2,
+          method: 'session/load',
+          params: { sessionId, cwd: process.cwd(), mcpServers: [] }
+        })
+        return
+      }
+
       if (msg?.id === 2) {
-        if (msg?.result !== null) {
-          reject(new Error('Expected session/load result to be null'))
+        if (msg?.error || !msg?.result) {
+          reject(new Error(`session/load failed: ${JSON.stringify(msg?.error ?? msg?.result)}`))
           return
         }
         a.kill()
@@ -105,12 +119,6 @@ async function loadAndCountReplay(sessionId) {
     a.proc.on('error', reject)
 
     a.send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: 1 } })
-    a.send({
-      jsonrpc: '2.0',
-      id: 2,
-      method: 'session/load',
-      params: { sessionId, cwd: process.cwd(), mcpServers: [] }
-    })
   })
 }
 

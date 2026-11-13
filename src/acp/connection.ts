@@ -1,6 +1,10 @@
 import {
   methods,
   type AgentContext,
+  type CreateElicitationRequest,
+  type CreateElicitationResponse,
+  type ReadTextFileRequest,
+  type ReadTextFileResponse,
   type RequestPermissionRequest,
   type RequestPermissionResponse,
   type SessionNotification
@@ -10,12 +14,16 @@ import {
 export interface AcpClientConnection {
   sessionUpdate(params: SessionNotification): Promise<void>
   requestPermission(params: RequestPermissionRequest): Promise<RequestPermissionResponse>
+  createElicitation(params: CreateElicitationRequest): Promise<CreateElicitationResponse>
+  readTextFile(params: ReadTextFileRequest): Promise<ReadTextFileResponse>
 }
 
 /** Resolves the client context lazily, since the agent is built before `connect()` returns. */
 export function clientConnection(getClient: () => AgentContext): AcpClientConnection {
   return {
     sessionUpdate: params => getClient().notify(methods.client.session.update, params),
-    requestPermission: params => getClient().request(methods.client.session.requestPermission, params)
+    requestPermission: params => getClient().request(methods.client.session.requestPermission, params),
+    createElicitation: params => getClient().request(methods.client.elicitation.create, params),
+    readTextFile: params => getClient().request(methods.client.fs.readTextFile, params)
   }
 }

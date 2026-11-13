@@ -16,14 +16,17 @@ export function normalizeAdditionalDirectories(input: readonly string[] | null |
 
   for (const entry of input) {
     if (typeof entry !== 'string') {
-      throw RequestError.invalidParams(`additionalDirectories entries must be absolute paths: ${String(entry)}`)
+      throw RequestError.invalidParams(
+        undefined,
+        `additionalDirectories entries must be absolute paths: ${String(entry)}`
+      )
     }
 
     const dir = entry.trim()
     if (!dir) continue
 
     if (!isAbsolute(dir)) {
-      throw RequestError.invalidParams(`additionalDirectories entries must be absolute paths: ${entry}`)
+      throw RequestError.invalidParams(undefined, `additionalDirectories entries must be absolute paths: ${entry}`)
     }
 
     if (resolvePath(dir) === resolvedCwd) continue

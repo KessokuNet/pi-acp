@@ -1,4 +1,4 @@
-import type { ToolKind } from '@agentclientprotocol/sdk/unstable'
+import type { ToolCallContent, ToolKind } from '@agentclientprotocol/sdk/unstable'
 
 export function toToolKind(toolName: string): ToolKind {
   switch (toolName) {
@@ -25,6 +25,35 @@ export function toToolKind(toolName: string): ToolKind {
     default:
       return 'other'
   }
+}
+
+/**
+ * Tool-call content for a pi tool result: text and image blocks in the order pi emitted them.
+ * pi's read tool returns image blocks as `{type:"image", data, mimeType}` alongside text.
+ */
+export function toolResultContent(result: unknown): ToolCallContent[] {
+  const content = (result as { content?: unknown } | null | undefined)?.content
+  const blocks: ToolCallContent[] = []
+
+  if (Array.isArray(content)) {
+    for (const block of content) {
+      if (block === null || typeof block !== 'object') continue
+      const b = block as { type?: unknown; text?: unknown; data?: unknown; mimeType?: unknown }
+      if (b.type === 'text' && typeof b.text === 'string' && b.text) {
+        blocks.push({ type: 'content', content: { type: 'text', text: b.text } })
+      } else if (b.type === 'image' && typeof b.data === 'string' && typeof b.mimeType === 'string') {
+        blocks.push({ type: 'content', content: { type: 'image', data: b.data, mimeType: b.mimeType } })
+      }
+    }
+  }
+
+  if (blocks.length) return blocks
+  // pi sent structured content we could not render (e.g. an image without a mime type); never
+  // fall back to dumping the raw payload, which would leak base64 into the card.
+  if (Array.isArray(content) && content.length) return []
+
+  const text = toolResultToText(result)
+  return text ? [{ type: 'content', content: { type: 'text', text } }] : []
 }
 
 export function toolResultToText(result: unknown): string {

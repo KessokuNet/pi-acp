@@ -1,7 +1,7 @@
-import type { SessionUpdate, ToolCallLocation } from '@agentclientprotocol/sdk/unstable'
-import { isAbsolute, resolve as resolvePath } from 'node:path'
+import type { SessionUpdate } from '@agentclientprotocol/sdk/unstable'
 import { bashCommand } from './bash.js'
-import { toToolKind, toolResultToText } from './pi-tools.js'
+import { toToolKind, toolResultContent } from './pi-tools.js'
+import { getToolPath, toToolCallLocations } from './tool-args.js'
 
 /**
  * Translates finished pi messages (as stored in a session or a pi-subagents `.output` transcript)
@@ -25,14 +25,8 @@ function textOf(content: unknown): string {
 
 function toolTitle(name: string, args: unknown): string {
   if (name === 'bash') return bashCommand(args) ?? name
-  const path = asRecord(args)?.path
-  return typeof path === 'string' ? `${name} ${path}` : name
-}
-
-function toolLocations(args: unknown, cwd: string): ToolCallLocation[] | undefined {
-  const path = asRecord(args)?.path
-  if (typeof path !== 'string' || path === '') return undefined
-  return [{ path: isAbsolute(path) ? path : resolvePath(cwd, path) }]
+  const path = getToolPath(args)
+  return path ? `${name} ${path}` : name
 }
 
 /** Convert one pi message into the ACP updates that render it. Unknown roles yield nothing. */
@@ -62,7 +56,7 @@ export function piMessageToUpdates(message: unknown, cwd: string): SessionUpdate
           kind: toToolKind(b.name),
           status: 'in_progress',
           rawInput: b.arguments,
-          locations: toolLocations(b.arguments, cwd)
+          locations: toToolCallLocations(b.arguments, cwd)
         })
       }
     }
@@ -70,13 +64,13 @@ export function piMessageToUpdates(message: unknown, cwd: string): SessionUpdate
   }
 
   if (m.role === 'toolResult' && typeof m.toolCallId === 'string') {
-    const text = toolResultToText(m)
+    const content = toolResultContent(m)
     return [
       {
         sessionUpdate: 'tool_call_update',
         toolCallId: m.toolCallId,
         status: m.isError === true ? 'failed' : 'completed',
-        content: text ? [{ type: 'content', content: { type: 'text', text } }] : undefined
+        content: content.length ? content : undefined
       }
     ]
   }

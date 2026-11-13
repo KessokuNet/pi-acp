@@ -31,6 +31,23 @@ test('toUsageUpdate: rejects missing or unusable counts', () => {
   }
 })
 
+test("toUsageUpdate: carries pi's cumulative cost in USD", () => {
+  assert.deepEqual(toUsageUpdate({ contextUsage: { tokens: 10, contextWindow: 100 }, cost: 0.25 }), {
+    sessionUpdate: 'usage_update',
+    used: 10,
+    size: 100,
+    cost: { amount: 0.25, currency: 'USD' }
+  })
+})
+
+test('toUsageUpdate: omits cost when pi reports none or a non-number', () => {
+  const base = { contextUsage: { tokens: 10, contextWindow: 100 } }
+
+  for (const stats of [base, { ...base, cost: null }, { ...base, cost: '1.00' }, { ...base, cost: -1 }]) {
+    assert.deepEqual(toUsageUpdate(stats), { sessionUpdate: 'usage_update', used: 10, size: 100 })
+  }
+})
+
 test('toToolKind: maps pi tool names to ACP tool kinds', () => {
   assert.equal(toToolKind('read'), 'read')
   assert.equal(toToolKind('ls'), 'read')

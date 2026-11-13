@@ -28,26 +28,18 @@ import {
   type CloseSessionResponse,
   type LogoutRequest,
   type LogoutResponse,
-  type ClientCapabilities
+  type ClientCapabilities,
+  type ContentBlock
 } from '@agentclientprotocol/sdk/unstable'
 import type { AcpClientConnection } from './connection.js'
 import { getAuthMethods } from './auth.js'
-import { SessionManager, type PiAcpSession } from './session.js'
+import { SessionManager, type PiAcpSession, toToolCallLocations } from './session.js'
 import { SessionStore } from './session-store.js'
 import { PiRpcProcess } from '../pi-rpc/process.js'
 import { listPiSessions, findPiSession } from './pi-sessions.js'
-import { normalizePiAssistantText, normalizePiMessageText } from './translate/pi-messages.js'
-import { toolResultToText } from './translate/pi-tools.js'
-import {
-  bashCommand,
-  bashExitCode,
-  bashResultText,
-  bashTerminalContent,
-  bashTerminalExitMeta,
-  bashTerminalInfoMeta,
-  bashTerminalOutputMeta,
-  isBashTool
-} from './translate/bash.js'
+import { normalizePiMessageText } from './translate/pi-messages.js'
+import { toolResultContent, toToolKind } from './translate/pi-tools.js'
+import { bashCommand, bashExitCode, bashResultText, isBashTool } from './translate/bash.js'
 import { promptToPiMessage } from './translate/prompt.js'
 import { loadSlashCommands, parseCommandArgs, toAvailableCommands } from './slash-commands.js'
 import { getAgentDir, getEnableSkillCommands, getQuietStartup } from './pi-settings.js'
@@ -67,6 +59,38 @@ import { join, dirname, basename } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { normalizeAdditionalDirectories } from './workspace-roots.js'
 
+export type SteerRequest = {
+  sessionId: string
+  prompt: ContentBlock[]
+  _meta?: { steering?: { idleBehavior?: string } }
+}
+
+export type SteerResponse = {
+  outcome: 'injected' | 'promptRequired' | 'startedNewTurn'
+}
+
+/** Parser for the custom `_session/steering` extension method. */
+export function parseSteerParams(params: unknown): SteerRequest {
+  const raw = (params ?? {}) as Record<string, unknown>
+
+  if (typeof raw.sessionId !== 'string' || raw.sessionId.length === 0) {
+    throw RequestError.invalidParams(undefined, 'Missing sessionId')
+  }
+
+  if (!Array.isArray(raw.prompt)) {
+    throw RequestError.invalidParams(undefined, 'Missing prompt')
+  }
+
+  const meta = raw._meta as { steering?: { idleBehavior?: unknown } } | undefined
+  const idleBehavior = meta?.steering?.idleBehavior
+
+  return {
+    sessionId: raw.sessionId,
+    prompt: raw.prompt as ContentBlock[],
+    _meta: typeof idleBehavior === 'string' ? { steering: { idleBehavior } } : undefined
+  }
+}
+
 type AdvertisedModel = {
   modelId: string
   name: string
@@ -75,6 +99,8 @@ type AdvertisedModel = {
 
 const MODEL_CONFIG_ID = 'model'
 const THOUGHT_LEVEL_CONFIG_ID = 'thought_level'
+const AUTO_COMPACTION_CONFIG_ID = 'auto_compaction'
+const AUTO_RETRY_CONFIG_ID = 'auto_retry'
 
 function builtinAvailableCommands(): AvailableCommand[] {
   return [
@@ -210,7 +236,7 @@ export class PiAcpAgent {
     const restorePromise = (async () => {
       const stored = this.findStoredSession(sessionId)
       if (!stored) {
-        throw RequestError.invalidParams(`Unknown sessionId: ${sessionId}`)
+        throw RequestError.invalidParams(undefined, `Unknown sessionId: ${sessionId}`)
       }
 
       const cwd = opts?.cwd ?? stored.cwd
@@ -304,13 +330,20 @@ export class PiAcpAgent {
           close: {},
           title: {}
         }
+      },
+      // Nonstandard extension method, matching claude-code-acp's convention: clients that
+      // support it can inject a message into the running turn via `_session/steering`.
+      _meta: {
+        steering: {
+          supported: true
+        }
       }
     }
   }
 
   async newSession(params: NewSessionRequest) {
     if (!isAbsolute(params.cwd)) {
-      throw RequestError.invalidParams(`cwd must be an absolute path: ${params.cwd}`)
+      throw RequestError.invalidParams(undefined, `cwd must be an absolute path: ${params.cwd}`)
     }
 
     const additionalDirectories = normalizeAdditionalDirectories(params.additionalDirectories, params.cwd)
@@ -400,10 +433,14 @@ export class PiAcpAgent {
       )
     }
 
-    const { configOptions, models, modes } = await getSessionConfiguration(session.proc, {
-      state,
-      availableModels
-    })
+    const { configOptions, models, modes } = await getSessionConfiguration(
+      session.proc,
+      {
+        state,
+        availableModels
+      },
+      { clientCapabilities: this.clientCapabilities, autoRetryEnabled: session.autoRetryEnabled }
+    )
 
     const quietStartup = getQuietStartup(params.cwd)
     const updateNotice = buildUpdateNotice()
@@ -962,6 +999,25 @@ export class PiAcpAgent {
     return { stopReason }
   }
 
+  /**
+   * `_session/steering` extension method. Clients that support it can inject a message into the
+   * running turn instead of queueing it; the shape mirrors claude-code-acp so a client that
+   * implements one adapter's steering works with the other's.
+   */
+  async steerSession(params: SteerRequest): Promise<SteerResponse> {
+    const session = await this.restoreSession(params.sessionId)
+
+    const { message, images } = promptToPiMessage(params.prompt ?? [], session.cwd)
+
+    const idleBehavior = params._meta?.steering?.idleBehavior
+
+    const outcome = await session.steer(message, images, {
+      idleBehavior: idleBehavior === 'promptRequired' ? 'promptRequired' : undefined
+    })
+
+    return { outcome }
+  }
+
   async cancel(params: CancelNotification): Promise<void> {
     const session = this.sessions.maybeGet(params.sessionId)
     if (!session) return
@@ -999,7 +1055,7 @@ export class PiAcpAgent {
 
   async loadSession(params: LoadSessionRequest): Promise<LoadSessionResponse> {
     if (!isAbsolute(params.cwd)) {
-      throw RequestError.invalidParams(`cwd must be an absolute path: ${params.cwd}`)
+      throw RequestError.invalidParams(undefined, `cwd must be an absolute path: ${params.cwd}`)
     }
 
     // If the client is re-loading a session that is already active, tear down the existing
@@ -1011,7 +1067,7 @@ export class PiAcpAgent {
 
     const stored = this.findStoredSession(params.sessionId)
     if (!stored) {
-      throw RequestError.invalidParams(`Unknown sessionId: ${params.sessionId}`)
+      throw RequestError.invalidParams(undefined, `Unknown sessionId: ${params.sessionId}`)
     }
 
     const preexistingSessionIds: string[] = (this.sessions as any).sessionIds?.() ?? []
@@ -1040,6 +1096,23 @@ export class PiAcpAgent {
     const data = (await proc.getMessages()) as any
     const messages = Array.isArray(data?.messages) ? data.messages : []
 
+    // pi splits a tool call across two messages: the assistant message holds the tool's name and
+    // input, the toolResult message holds its output. Index the inputs so a restored card can carry
+    // the command, diff, or file path it actually ran.
+    const toolCallArgs = new Map<string, unknown>()
+    for (const m of messages) {
+      if (String((m as any)?.role ?? '') !== 'assistant') continue
+      const content = (m as any)?.content
+      if (!Array.isArray(content)) continue
+      for (const block of content as any[]) {
+        if (block?.type !== 'toolCall') continue
+        const id = String(block?.id ?? '')
+        if (!id) continue
+        const args = block?.arguments ?? block?.args ?? block?.input
+        if (args && typeof args === 'object') toolCallArgs.set(id, args)
+      }
+    }
+
     for (const m of messages) {
       const role = String(m?.role ?? '')
 
@@ -1057,15 +1130,32 @@ export class PiAcpAgent {
       }
 
       if (role === 'assistant') {
-        const text = normalizePiAssistantText(m?.content)
-        if (text) {
-          await this.conn.sessionUpdate({
-            sessionId: session.sessionId,
-            update: {
-              sessionUpdate: 'agent_message_chunk',
-              content: { type: 'text', text }
+        const content = Array.isArray(m?.content) ? (m.content as any[]) : []
+
+        for (const block of content) {
+          if (block?.type === 'thinking') {
+            const thinking = typeof block.thinking === 'string' ? block.thinking : block.text
+            if (typeof thinking === 'string' && thinking) {
+              await this.conn.sessionUpdate({
+                sessionId: session.sessionId,
+                update: {
+                  sessionUpdate: 'agent_thought_chunk',
+                  content: { type: 'text', text: thinking }
+                }
+              })
             }
-          })
+            continue
+          }
+
+          if (block?.type === 'text' && typeof block.text === 'string' && block.text) {
+            await this.conn.sessionUpdate({
+              sessionId: session.sessionId,
+              update: {
+                sessionUpdate: 'agent_message_chunk',
+                content: { type: 'text', text: block.text }
+              }
+            })
+          }
         }
       }
 
@@ -1074,54 +1164,29 @@ export class PiAcpAgent {
         const toolCallId = String((m as any)?.toolCallId ?? crypto.randomUUID())
         const isError = Boolean((m as any)?.isError)
         const isBash = isBashTool(toolName)
+        const args = toolCallArgs.get(toolCallId)
+        const locations = toToolCallLocations(args, params.cwd)
 
         if (isBash) {
           const text = bashResultText(m)
+          const exitCode = bashExitCode(m, isError)
+          const body = exitCode !== 0 ? `${text}\n\nexit code: ${exitCode}` : text
 
-          // Terminal-less clients can't read the terminal `_meta` channel, so replay historic bash
-          // as a single completed tool call with a plain `content` text block (output + non-zero
-          // exit code), mirroring the live path in session.ts.
-          if (this.clientCapabilities?.terminal !== true) {
-            const exitCode = bashExitCode(m, isError)
-            const body = exitCode !== 0 ? `${text}\n\nexit code: ${exitCode}` : text
-            await this.conn.sessionUpdate({
-              sessionId: session.sessionId,
-              update: {
-                sessionUpdate: 'tool_call',
-                toolCallId,
-                title: bashCommand(m) ?? toolName,
-                kind: 'execute',
-                status: isError ? 'failed' : 'completed',
-                content: body ? [{ type: 'content', content: { type: 'text', text: body } }] : undefined,
-                rawOutput: m
-              }
-            })
-            continue
-          }
-
+          // A restored call's terminal belonged to the process that died with the last connection,
+          // so replaying the terminal `_meta` channel leaves an empty card. Replay the output as a
+          // plain text block instead; the live path in session.ts still streams real terminals.
           await this.conn.sessionUpdate({
             sessionId: session.sessionId,
             update: {
               sessionUpdate: 'tool_call',
               toolCallId,
-              title: bashCommand(m) ?? toolName,
+              title: bashCommand(args) ?? toolName,
               kind: 'execute',
-              status: 'completed',
-              content: bashTerminalContent(toolCallId),
-              _meta: bashTerminalInfoMeta(toolCallId, params.cwd)
-            }
-          })
-
-          await this.conn.sessionUpdate({
-            sessionId: session.sessionId,
-            update: {
-              sessionUpdate: 'tool_call_update',
-              toolCallId,
               status: isError ? 'failed' : 'completed',
-              _meta: {
-                ...(text ? bashTerminalOutputMeta(toolCallId, text) : {}),
-                ...bashTerminalExitMeta(toolCallId, bashExitCode(m, isError))
-              }
+              content: body ? [{ type: 'content', content: { type: 'text', text: body } }] : undefined,
+              locations,
+              rawInput: args,
+              rawOutput: m
             }
           })
           continue
@@ -1134,28 +1199,32 @@ export class PiAcpAgent {
             sessionUpdate: 'tool_call',
             toolCallId,
             title: toolName,
-            kind: toolName === 'read' ? 'read' : toolName === 'write' || toolName === 'edit' ? 'edit' : 'other',
+            kind: toToolKind(toolName),
             status: 'completed',
-            rawInput: null,
+            locations,
+            rawInput: args,
             rawOutput: m
           }
         })
 
-        const text = toolResultToText(m)
+        const content = toolResultContent(m)
         await this.conn.sessionUpdate({
           sessionId: session.sessionId,
           update: {
             sessionUpdate: 'tool_call_update',
             toolCallId,
             status: isError ? 'failed' : 'completed',
-            content: text ? [{ type: 'content', content: { type: 'text', text } }] : null,
+            content: content.length ? content : null,
             rawOutput: m
           }
         })
       }
     }
 
-    const { configOptions, models, modes } = await getSessionConfiguration(proc)
+    const { configOptions, models, modes } = await getSessionConfiguration(proc, undefined, {
+      clientCapabilities: this.clientCapabilities,
+      autoRetryEnabled: session.autoRetryEnabled
+    })
 
     const response = {
       configOptions,
@@ -1240,7 +1309,7 @@ export class PiAcpAgent {
    */
   async resumeSession(params: ResumeSessionRequest): Promise<ResumeSessionResponse> {
     if (!isAbsolute(params.cwd)) {
-      throw RequestError.invalidParams(`cwd must be an absolute path: ${params.cwd}`)
+      throw RequestError.invalidParams(undefined, `cwd must be an absolute path: ${params.cwd}`)
     }
 
     const additionalDirectories = normalizeAdditionalDirectories(params.additionalDirectories, params.cwd)
@@ -1261,7 +1330,10 @@ export class PiAcpAgent {
 
     ;(this.sessions as any).closeAllExcept?.(session.sessionId, preexistingSessionIds)
 
-    const { configOptions, modes } = await getSessionConfiguration(proc)
+    const { configOptions, modes } = await getSessionConfiguration(proc, undefined, {
+      clientCapabilities: this.clientCapabilities,
+      autoRetryEnabled: session.autoRetryEnabled
+    })
 
     // Advertise slash commands after the response so the client knows the session exists.
     setTimeout(() => {
@@ -1323,7 +1395,7 @@ export class PiAcpAgent {
 
   async setSessionTitle(params: SetSessionTitleRequest): Promise<SetSessionTitleResponse> {
     if (typeof params.title !== 'string' || !params.title.trim()) {
-      throw RequestError.invalidParams('Session title must not be empty')
+      throw RequestError.invalidParams(undefined, 'Session title must not be empty')
     }
     const title = params.title.trim()
     const session = await this.restoreSession(params.sessionId)
@@ -1336,7 +1408,7 @@ export class PiAcpAgent {
 
     const mode = String(params.modeId)
     if (!(await getThinkingState(session.proc)).availableModes.some(option => option.id === mode)) {
-      throw RequestError.invalidParams(`Unknown modeId: ${mode}`)
+      throw RequestError.invalidParams(undefined, `Unknown modeId: ${mode}`)
     }
 
     await session.proc.setThinkingLevel(mode)
@@ -1359,32 +1431,44 @@ export class PiAcpAgent {
     const session = await this.restoreSession(params.sessionId)
     const configId = String(params.configId)
 
-    if (typeof params.value !== 'string') {
-      throw RequestError.invalidParams(`Expected string value for config option: ${configId}`)
-    }
-
-    if (configId === MODEL_CONFIG_ID) {
-      await setSessionModel(session.proc, params.value)
-      this.publishContextUsage(session)
-    } else if (configId === THOUGHT_LEVEL_CONFIG_ID) {
-      if (!(await getThinkingState(session.proc)).availableModes.some(option => option.id === params.value)) {
-        throw RequestError.invalidParams(`Unknown thinking level: ${params.value}`)
+    if (typeof params.value === 'boolean') {
+      if (configId === AUTO_COMPACTION_CONFIG_ID) {
+        await session.proc.setAutoCompaction(params.value)
+      } else if (configId === AUTO_RETRY_CONFIG_ID) {
+        await session.proc.setAutoRetry(params.value)
+        session.autoRetryEnabled = params.value
+      } else {
+        throw RequestError.invalidParams(undefined, `Config option does not take a boolean: ${configId}`)
       }
-
-      await session.proc.setThinkingLevel(params.value)
-
-      void this.conn.sessionUpdate({
-        sessionId: session.sessionId,
-        update: {
-          sessionUpdate: 'current_mode_update',
-          currentModeId: params.value
+    } else if (typeof params.value === 'string') {
+      if (configId === MODEL_CONFIG_ID) {
+        await setSessionModel(session.proc, params.value)
+        this.publishContextUsage(session)
+      } else if (configId === THOUGHT_LEVEL_CONFIG_ID) {
+        if (!(await getThinkingState(session.proc)).availableModes.some(option => option.id === params.value)) {
+          throw RequestError.invalidParams(undefined, `Unknown thinking level: ${params.value}`)
         }
-      })
+
+        await session.proc.setThinkingLevel(params.value)
+
+        void this.conn.sessionUpdate({
+          sessionId: session.sessionId,
+          update: {
+            sessionUpdate: 'current_mode_update',
+            currentModeId: params.value
+          }
+        })
+      } else {
+        throw RequestError.invalidParams(undefined, `Unknown config option: ${configId}`)
+      }
     } else {
-      throw RequestError.invalidParams(`Unknown config option: ${configId}`)
+      throw RequestError.invalidParams(undefined, `Unsupported value for config option: ${configId}`)
     }
 
-    const configOptions = await emitConfigOptionsUpdate(this.conn, session.sessionId, session.proc)
+    const configOptions = await emitConfigOptionsUpdate(this.conn, session.sessionId, session.proc, {
+      clientCapabilities: this.clientCapabilities,
+      autoRetryEnabled: session.autoRetryEnabled
+    })
     return { configOptions }
   }
 }
@@ -1437,9 +1521,25 @@ async function getThinkingState(
   }
 }
 
+/** Booleans the client was told about; only built when it advertised boolean config options. */
+type BooleanConfigOptions = {
+  autoCompaction?: boolean
+  autoRetry: boolean
+}
+
+type ConfigOptionContext = {
+  clientCapabilities?: ClientCapabilities
+  autoRetryEnabled?: boolean
+}
+
+function supportsBooleanConfigOptions(context?: ConfigOptionContext): boolean {
+  return context?.clientCapabilities?.session?.configOptions?.boolean != null
+}
+
 async function getSessionConfiguration(
   proc: PiRpcProcess,
-  pre?: { state?: any | null; availableModels?: any | null }
+  pre?: { state?: any | null; availableModels?: any | null },
+  context?: ConfigOptionContext
 ): Promise<{
   configOptions: SessionConfigOption[]
   models: {
@@ -1455,29 +1555,50 @@ async function getSessionConfiguration(
     currentModeId: string
   }
 }> {
-  const [models, modes] = await Promise.all([getModelState(proc, pre), getThinkingState(proc, { state: pre?.state })])
+  const wantsBooleans = supportsBooleanConfigOptions(context)
+  let state = pre?.state ?? null
+
+  if (wantsBooleans && state === null) {
+    state = (await proc.getState().catch(() => null)) as any
+  }
+
+  const [models, modes] = await Promise.all([
+    getModelState(proc, { state, availableModels: pre?.availableModels }),
+    getThinkingState(proc, { state })
+  ])
 
   return {
-    configOptions: buildConfigOptions({ models, modes }),
+    configOptions: buildConfigOptions({ models, modes }, wantsBooleans ? booleanOptions(state, context) : undefined),
     models,
     modes
   }
 }
 
-function buildConfigOptions(state: {
-  models: {
-    availableModels: AdvertisedModel[]
-    currentModelId: string
-  } | null
-  modes: {
-    availableModes: Array<{
-      id: string
-      name: string
-      description?: string | null
-    }>
-    currentModeId: string
-  }
-}): SessionConfigOption[] {
+/** pi reports auto-compaction but not auto-retry, so the retry value is the adapter's mirror. */
+function booleanOptions(state: any | null, context?: ConfigOptionContext): BooleanConfigOptions {
+  const booleans: BooleanConfigOptions = { autoRetry: context?.autoRetryEnabled ?? true }
+  const autoCompaction = state?.autoCompactionEnabled
+  if (typeof autoCompaction === 'boolean') booleans.autoCompaction = autoCompaction
+  return booleans
+}
+
+function buildConfigOptions(
+  state: {
+    models: {
+      availableModels: AdvertisedModel[]
+      currentModelId: string
+    } | null
+    modes: {
+      availableModes: Array<{
+        id: string
+        name: string
+        description?: string | null
+      }>
+      currentModeId: string
+    }
+  },
+  booleans?: BooleanConfigOptions
+): SessionConfigOption[] {
   const configOptions: SessionConfigOption[] = [
     {
       type: 'select',
@@ -1507,6 +1628,26 @@ function buildConfigOptions(state: {
         name: model.name,
         description: model.description ?? null
       }))
+    })
+  }
+
+  if (typeof booleans?.autoCompaction === 'boolean') {
+    configOptions.push({
+      type: 'boolean',
+      id: AUTO_COMPACTION_CONFIG_ID,
+      name: 'Auto-compaction',
+      description: 'Compact the context automatically when it approaches the model limit',
+      currentValue: booleans.autoCompaction
+    })
+  }
+
+  if (booleans) {
+    configOptions.push({
+      type: 'boolean',
+      id: AUTO_RETRY_CONFIG_ID,
+      name: 'Auto-retry',
+      description: 'Retry a failed model request automatically',
+      currentValue: booleans.autoRetry
     })
   }
 
@@ -1583,9 +1724,10 @@ async function getModelState(
 async function emitConfigOptionsUpdate(
   conn: AcpClientConnection,
   sessionId: string,
-  proc: PiRpcProcess
+  proc: PiRpcProcess,
+  context?: ConfigOptionContext
 ): Promise<SessionConfigOption[]> {
-  const { configOptions } = await getSessionConfiguration(proc)
+  const { configOptions } = await getSessionConfiguration(proc, undefined, context)
 
   await conn.sessionUpdate({
     sessionId,
@@ -1624,7 +1766,7 @@ async function setSessionModel(proc: PiRpcProcess, requestedModelId: string): Pr
   }
 
   if (!provider || !modelId) {
-    throw RequestError.invalidParams(`Unknown modelId: ${requestedModelId}`)
+    throw RequestError.invalidParams(undefined, `Unknown modelId: ${requestedModelId}`)
   }
 
   await proc.setModel(provider, modelId)

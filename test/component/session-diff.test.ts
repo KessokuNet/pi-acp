@@ -180,6 +180,85 @@ test('PiAcpSession: emits write diff content from actual before/after file conte
   assert.equal((end.update as any).rawOutput, undefined, 'expected raw output to be suppressed when diff is emitted')
 })
 
+test('PiAcpSession: prefers the client buffer over disk when building an edit diff', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pi-acp-diff-client-'))
+  mkdirSync(dir, { recursive: true })
+  const filePath = join(dir, 'a.txt')
+  writeFileSync(filePath, 'on disk\n', 'utf8')
+
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  conn.fileContents.set(filePath, 'unsaved in editor\n')
+
+  new PiAcpSession({
+    sessionId: 's1',
+    cwd: dir,
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: [],
+    clientCapabilities: { fs: { readTextFile: true } }
+  })
+
+  proc.emit({ type: 'tool_execution_start', toolCallId: 't1', toolName: 'edit', args: { path: 'a.txt' } })
+  writeFileSync(filePath, 'after\n', 'utf8')
+  proc.emit({
+    type: 'tool_execution_end',
+    toolCallId: 't1',
+    isError: false,
+    result: { content: [{ type: 'text', text: 'ok' }] }
+  })
+
+  await new Promise(r => setTimeout(r, 0))
+  await new Promise(r => setTimeout(r, 0))
+
+  assert.deepEqual(conn.fileReads, [{ sessionId: 's1', path: filePath }])
+  const end = completedToolUpdate(conn)
+  const diff = (end?.update as any).content?.find((c: any) => c.type === 'diff')
+  assert.ok(diff, 'expected diff content item')
+  assert.equal(diff.oldText, 'unsaved in editor\n')
+  assert.equal(diff.newText, 'after\n')
+})
+
+test('PiAcpSession: falls back to disk when the client cannot read the file', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pi-acp-diff-client-miss-'))
+  mkdirSync(dir, { recursive: true })
+  const filePath = join(dir, 'a.txt')
+  writeFileSync(filePath, 'before\n', 'utf8')
+
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  new PiAcpSession({
+    sessionId: 's1',
+    cwd: dir,
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: [],
+    clientCapabilities: { fs: { readTextFile: true } }
+  })
+
+  proc.emit({ type: 'tool_execution_start', toolCallId: 't1', toolName: 'edit', args: { path: 'a.txt' } })
+  writeFileSync(filePath, 'after\n', 'utf8')
+  proc.emit({
+    type: 'tool_execution_end',
+    toolCallId: 't1',
+    isError: false,
+    result: { content: [{ type: 'text', text: 'ok' }] }
+  })
+
+  await new Promise(r => setTimeout(r, 0))
+  await new Promise(r => setTimeout(r, 0))
+
+  assert.equal(conn.fileReads.length, 1)
+  const end = completedToolUpdate(conn)
+  const diff = (end?.update as any).content?.find((c: any) => c.type === 'diff')
+  assert.ok(diff, 'expected diff content item')
+  assert.equal(diff.oldText, 'before\n')
+  assert.equal(diff.newText, 'after\n')
+})
+
 test('PiAcpSession: emits write diff content for new files on completion', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'pi-acp-diff-'))
   mkdirSync(dir, { recursive: true })

@@ -30,9 +30,18 @@ function stripAnsi(s: string): string {
   return s.replace(ANSI_ESCAPE_REGEX, '')
 }
 
+type PromptStreamingBehavior = 'steer' | 'followUp'
+
 type PiRpcCommand =
-  | { type: 'prompt'; id?: string; message: string; images?: unknown[] }
+  | {
+      type: 'prompt'
+      id?: string
+      message: string
+      images?: unknown[]
+      streamingBehavior?: PromptStreamingBehavior
+    }
   | { type: 'abort'; id?: string }
+  | { type: 'clear_queue'; id?: string }
   | { type: 'get_state'; id?: string }
   // Model
   | { type: 'get_available_models'; id?: string }
@@ -46,6 +55,7 @@ type PiRpcCommand =
   // Compaction
   | { type: 'compact'; id?: string; customInstructions?: string }
   | { type: 'set_auto_compaction'; id?: string; enabled: boolean }
+  | { type: 'set_auto_retry'; id?: string; enabled: boolean }
   // Session
   | { type: 'get_session_stats'; id?: string }
   | { type: 'set_session_name'; id?: string; name: string }
@@ -337,9 +347,20 @@ export class PiRpcProcess {
     return lines
   }
 
-  async prompt(message: string, images: unknown[] = []): Promise<void> {
-    const res = await this.request({ type: 'prompt', message, images })
+  async prompt(message: string, images: unknown[] = [], streamingBehavior?: PromptStreamingBehavior): Promise<void> {
+    const res = await this.request({ type: 'prompt', message, images, streamingBehavior })
     if (!res.success) throw new Error(`pi prompt failed: ${res.error ?? JSON.stringify(res.data)}`)
+  }
+
+  /** pi requires a disposition for prompts sent while a turn is already running. */
+  async clearQueue(): Promise<{ steering: string[]; followUp: string[] }> {
+    const res = await this.request({ type: 'clear_queue' })
+    if (!res.success) throw new Error(`pi clear_queue failed: ${res.error ?? JSON.stringify(res.data)}`)
+    const data = (res.data ?? {}) as { steering?: unknown; followUp?: unknown }
+    return {
+      steering: Array.isArray(data.steering) ? (data.steering as string[]) : [],
+      followUp: Array.isArray(data.followUp) ? (data.followUp as string[]) : []
+    }
   }
 
   async abort(): Promise<void> {
@@ -396,6 +417,11 @@ export class PiRpcProcess {
   async setAutoCompaction(enabled: boolean): Promise<void> {
     const res = await this.request({ type: 'set_auto_compaction', enabled })
     if (!res.success) throw new Error(`pi set_auto_compaction failed: ${res.error ?? JSON.stringify(res.data)}`)
+  }
+
+  async setAutoRetry(enabled: boolean): Promise<void> {
+    const res = await this.request({ type: 'set_auto_retry', enabled })
+    if (!res.success) throw new Error(`pi set_auto_retry failed: ${res.error ?? JSON.stringify(res.data)}`)
   }
 
   async getSessionStats(): Promise<unknown> {

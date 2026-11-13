@@ -68,6 +68,35 @@ test('piMessageToUpdates: translates user, assistant blocks and tool results', (
   assert.deepEqual(piMessageToUpdates({ role: 'system', content: 'x' }, CWD), [])
 })
 
+test('piMessageToUpdates: keeps image blocks in tool results', () => {
+  assert.deepEqual(
+    piMessageToUpdates(
+      {
+        role: 'toolResult',
+        toolCallId: 'c2',
+        toolName: 'read',
+        content: [
+          { type: 'text', text: 'read shot.png' },
+          { type: 'image', data: 'AAAA', mimeType: 'image/png' }
+        ],
+        isError: false
+      },
+      CWD
+    ),
+    [
+      {
+        sessionUpdate: 'tool_call_update',
+        toolCallId: 'c2',
+        status: 'completed',
+        content: [
+          { type: 'content', content: { type: 'text', text: 'read shot.png' } },
+          { type: 'content', content: { type: 'image', data: 'AAAA', mimeType: 'image/png' } }
+        ]
+      }
+    ]
+  )
+})
+
 function harness(opts: { supportsSubagents: boolean; files?: Record<string, string> }) {
   const emitted: Array<{ sessionId: string; update: SessionUpdate }> = []
   const files = opts.files ?? {}
@@ -157,6 +186,44 @@ test('SubagentSessions: completion drains the transcript, then reports idle', ()
         sessionUpdate: 'subagent_update',
         sessionId: childSessionId('a1'),
         state: { state: 'idle', stopReason: 'end_turn' }
+      }
+    ]
+  )
+})
+
+test('SubagentSessions: a failed child reports the reason on the idle state', () => {
+  const { bridge, emitted } = harness({ supportsSubagents: true })
+
+  bridge.onAgent({ id: 'a1', description: 'Explore repo', status: 'started' })
+  emitted.length = 0
+  bridge.onAgent({ id: 'a1', status: 'failed', error: 'context window exceeded' })
+
+  assert.deepEqual(
+    emitted.map(e => e.update),
+    [
+      {
+        sessionUpdate: 'subagent_update',
+        sessionId: childSessionId('a1'),
+        state: { state: 'idle', stopReason: 'error', error: { code: -32603, message: 'context window exceeded' } }
+      }
+    ]
+  )
+})
+
+test('SubagentSessions: a failed child without a reason still reports the error state', () => {
+  const { bridge, emitted } = harness({ supportsSubagents: true })
+
+  bridge.onAgent({ id: 'a1', description: 'Explore repo', status: 'started' })
+  emitted.length = 0
+  bridge.onAgent({ id: 'a1', status: 'failed' })
+
+  assert.deepEqual(
+    emitted.map(e => e.update),
+    [
+      {
+        sessionUpdate: 'subagent_update',
+        sessionId: childSessionId('a1'),
+        state: { state: 'idle', stopReason: 'error' }
       }
     ]
   )

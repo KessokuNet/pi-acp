@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { toolResultToText } from '../../src/acp/translate/pi-tools.js'
+import { toolResultContent, toolResultToText } from '../../src/acp/translate/pi-tools.js'
 
 test('toolResultToText: extracts text from content blocks', () => {
   const text = toolResultToText({
@@ -37,4 +37,31 @@ test('toolResultToText: extracts bash stdout/stderr from details', () => {
   assert.match(text, /stderr:/)
   assert.match(text, /warn/)
   assert.match(text, /exit code: 0/)
+})
+
+test('toolResultContent: keeps text and image blocks in order', () => {
+  const content = toolResultContent({
+    content: [
+      { type: 'text', text: 'read screenshot.png' },
+      { type: 'image', data: 'AAAA', mimeType: 'image/png' }
+    ]
+  })
+
+  assert.deepEqual(content, [
+    { type: 'content', content: { type: 'text', text: 'read screenshot.png' } },
+    { type: 'content', content: { type: 'image', data: 'AAAA', mimeType: 'image/png' } }
+  ])
+})
+
+test('toolResultContent: renders an image-only result', () => {
+  const content = toolResultContent({ content: [{ type: 'image', data: 'BBBB', mimeType: 'image/jpeg' }] })
+  assert.deepEqual(content, [{ type: 'content', content: { type: 'image', data: 'BBBB', mimeType: 'image/jpeg' } }])
+})
+
+test('toolResultContent: falls back to text and skips unusable blocks', () => {
+  assert.deepEqual(toolResultContent({ details: { stdout: 'ok\n', exitCode: 0 } }), [
+    { type: 'content', content: { type: 'text', text: 'ok\n\n\nexit code: 0' } }
+  ])
+  assert.deepEqual(toolResultContent({ content: [{ type: 'image', data: 'CCCC' }] }), [])
+  assert.deepEqual(toolResultContent(undefined), [])
 })

@@ -37,6 +37,11 @@ child.stdout.on('data', chunk => {
       continue
     }
 
+    if (msg?.id === 1) {
+      send({ jsonrpc: '2.0', id: 2, method: 'session/new', params: { cwd, mcpServers: [] } })
+      return
+    }
+
     if (msg?.id === 2 && msg?.result?.sessionId && !sessionId) {
       sessionId = msg.result.sessionId
       send({
@@ -63,5 +68,4 @@ child.stdout.on('data', chunk => {
   }
 })
 
-send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: 1 } })
-send({ jsonrpc: '2.0', id: 2, method: 'session/new', params: { cwd, mcpServers: [] } })
+send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: 1, clientCapabilities: {} } })

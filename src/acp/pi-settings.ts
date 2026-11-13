@@ -41,6 +41,16 @@ export function getAgentDir(): string {
 }
 
 /**
+ * Mirror pi's `retry.enabled` setting (default on). pi exposes no RPC read for auto-retry, so the
+ * adapter starts its toggle from the same settings files pi would have loaded.
+ */
+export function getRetryEnabled(cwd: string): boolean {
+  const merged = getMergedSettings(cwd)
+  const enabled = isObject(merged.retry) ? merged.retry.enabled : undefined
+  return typeof enabled === 'boolean' ? enabled : true
+}
+
+/**
  * Mirror pi settings semantics (global + project merge, project overrides global).
  * Only returns the bits we currently need.
  */
