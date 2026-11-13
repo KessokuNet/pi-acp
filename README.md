@@ -100,40 +100,16 @@ pi's RPC stream carries no plan events, so pi-acp assembles the ACP `plan` from 
 merges them into one flat task list: plan snapshots on pi's bus, `TaskCreate` / `TaskUpdate` tool
 calls, and the subagent fleet. Each source is tagged, so a client can group them.
 
-#### `@tintinweb/pi-subagents`
+### Supported extensions
 
-The live fleet and pi-subagents' own final records become plan entries, each subagent a task with
-`pending` / `in_progress` / `completed` status, and each spawned child is linked to its `Agent` tool
-call as an ACP subagent session. See [Subagents as tasks](#subagents-as-tasks).
-
-#### `pi-cribsheet`
-
-Any plan source publishing on the `plan:snapshot` and `plan:update` bus channels is merged per
-namespace and emitted as plan entries, tagged so a client can group it apart from the subagent fleet.
-`pi-cribsheet` is the reference producer.
-
-#### `pi-tasks`
-
-`TaskCreate` and `TaskUpdate` tool calls are read from the RPC event stream and folded into the same
-plan. No bridge code is involved; the tool calls carry everything.
-
-### `@specode/pi-subscription-usage`
-
-The footer text it writes with `setStatus` reaches `session_info_update._meta.piAcp.status`, and a
-status line shaped like quota windows (`5h 88% ↻4h12m · 1w 89% ↻5d19h`) is also parsed into
-`usage_update._meta.piAcp.meters` as `{label, percent, resetInMs, text}`. The meters are re-sent when
-the status changes and dropped when it clears. Zed ignores `_meta`, so none of this renders there yet.
-
-### `@juicesharp/rpiv-ask-user-question`
-
-Its RPC fallback walks a questionnaire through `select` and `input`, so pi-acp renders one elicitation
-option list per question, with the "Type something." row and the multi-select text input intact.
-Clients without form elicitation get the same choices through `session/request_permission`.
-
-### `@fahrizkyputra/pi-auto-resume`
-
-Its resume countdown arrives as `setStatus` text and its warnings as `notify`, so the countdown lands
-in the status map and the warnings land as `notice` updates.
+| Extension                            | What pi-acp does with it                                                                                                                                                                                                                                                                         |
+| ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `@tintinweb/pi-subagents`            | Plan entries for the live fleet and its final records (`pending` / `in_progress` / `completed`), plus an ACP subagent session per spawned child, linked to its `Agent` tool call. See [Subagents as tasks](#subagents-as-tasks)                                                                  |
+| `pi-cribsheet`                       | Plan entries from `plan:snapshot` / `plan:update` bus snapshots, merged per namespace and tagged apart from the fleet. The reference plan source; any extension publishing those channels works                                                                                                  |
+| `pi-tasks`                           | Plan entries derived from `TaskCreate` / `TaskUpdate` tool calls on the RPC stream, without bridge code                                                                                                                                                                                          |
+| `@specode/pi-subscription-usage`     | Status text on `session_info_update._meta.piAcp.status`, and quota windows (`5h 88% ↻4h12m · 1w 89% ↻5d19h`) parsed into `usage_update._meta.piAcp.meters` as `{label, percent, resetInMs, text}`, re-sent on change and dropped when cleared. Zed ignores `_meta`, so nothing renders there yet |
+| `@juicesharp/rpiv-ask-user-question` | One elicitation option list per question, with the "Type something." row and the multi-select text input intact; `session/request_permission` for clients without form elicitation                                                                                                               |
+| `@fahrizkyputra/pi-auto-resume`      | Resume countdown in the status map, warnings as `notice` updates                                                                                                                                                                                                                                 |
 
 ## Prerequisites
 
