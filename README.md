@@ -47,6 +47,7 @@ On top of upstream it adds:
   - Tool results are forwarded as ACP content blocks, including images (pi's `read` can return a screenshot)
 - Usage and cost
   - `usage_update` reports context usage (`used`/`size`) and pi's cumulative session cost (`cost.amount`, in USD)
+  - When an extension status line looks like quota windows (`5h 88% ↻4h12m · 1w 89% ↻5d19h`, as `@specode/pi-subscription-usage` emits), the numbers ride along on `usage_update._meta.piAcp.meters` as `{label, percent, resetInMs, text}`, re-sent whenever the status changes, and dropped when the extension clears it. Zed ignores `_meta`, so nothing renders there yet
 - Configuration options
   - Model and thinking level are exposed as ACP `select` config options
 - Extension UI

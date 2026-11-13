@@ -84,6 +84,59 @@ test('PiAcpSession: publishes usage_update when a turn settles', async () => {
   assert.deepEqual(usage[0]!.update, { sessionUpdate: 'usage_update', used: 500, size: 1000 })
 })
 
+test('PiAcpSession: republishes quota meters on usage_update', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  proc.sessionStats = { contextUsage: { tokens: 500, contextWindow: 1000 } }
+
+  const session = new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  const turn = session.prompt('hello')
+  proc.emit({ type: 'agent_start' })
+  proc.emit({ type: 'agent_settled' })
+  await turn
+
+  proc.emit({
+    type: 'extension_ui_request',
+    id: 'ui-status',
+    method: 'setStatus',
+    statusKey: 'subscription-usage',
+    statusText: '5h 88% ↻4h12m · 1w 89% ↻5d19h'
+  })
+  await new Promise(r => setTimeout(r, 0))
+
+  const usage = conn.updates.filter(u => u.update.sessionUpdate === 'usage_update')
+  assert.equal(usage.length, 2)
+  assert.deepEqual(usage[1]!.update._meta, {
+    piAcp: {
+      meters: [
+        { label: '5h', percent: 88, resetInMs: 15_120_000, text: '5h 88% ↻4h12m' },
+        { label: '1w', percent: 89, resetInMs: 500_400_000, text: '1w 89% ↻5d19h' }
+      ]
+    }
+  })
+
+  proc.emit({
+    type: 'extension_ui_request',
+    id: 'ui-status-clear',
+    method: 'setStatus',
+    statusKey: 'subscription-usage',
+    statusText: ''
+  })
+  await new Promise(r => setTimeout(r, 0))
+
+  const cleared = conn.updates.filter(u => u.update.sessionUpdate === 'usage_update')
+  assert.equal(cleared.length, 3)
+  assert.equal(cleared[2]!.update._meta, undefined)
+})
+
 test('PiAcpSession: skips usage_update when pi reports no usable count', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()

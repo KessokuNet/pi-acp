@@ -13,6 +13,7 @@ import { AGENT_TOOL_NAME, SubagentSessions } from './subagent-sessions.js'
 import { readFileSync } from 'node:fs'
 import { isAbsolute, resolve as resolvePath } from 'node:path'
 import { PiRpcProcess, PiRpcSpawnError, type PiRpcEvent } from '../pi-rpc/process.js'
+import { parseStatusMeters, type PiAcpMeter } from './usage-meters.js'
 import { maybeAuthRequiredError } from './auth-required.js'
 import { SessionStore } from './session-store.js'
 import { expandSlashCommand, type FileSlashCommand } from './slash-commands.js'
@@ -335,6 +336,8 @@ export class PiAcpSession {
   private startupInfo: string | null = null
   private startupInfoSent = false
   private extensionStatus = new Map<string, string>()
+  private extensionMeters: PiAcpMeter[] = []
+  private lastUsage: Extract<SessionUpdate, { sessionUpdate: 'usage_update' }> | null = null
 
   readonly proc: PiRpcProcess
   private readonly conn: AcpClientConnection
@@ -560,7 +563,10 @@ export class PiAcpSession {
       void timeout.catch(() => {})
       const stats = await Promise.race([this.proc.getSessionStats(), timeout]).finally(() => clearTimeout(timer))
       const update = toUsageUpdate(stats)
-      if (update) this.emit(update)
+      if (update && update.sessionUpdate === 'usage_update') {
+        this.lastUsage = update
+        this.emit(this.usageWithMeters(update))
+      }
     } catch {
       // Usage is auxiliary.
     }
@@ -1303,10 +1309,28 @@ export class PiAcpSession {
     if (text) this.extensionStatus.set(key, text)
     else this.extensionStatus.delete(key)
 
+    const meters = text ? parseStatusMeters(text) : []
+    if (meters.length > 0) {
+      this.extensionMeters = meters
+      this.refreshUsageMeters()
+    } else if (!text && this.extensionMeters.length > 0) {
+      this.extensionMeters = []
+      this.refreshUsageMeters()
+    }
+
     this.emit({
       sessionUpdate: 'session_info_update',
       _meta: { piAcp: { status: Object.fromEntries(this.extensionStatus) } }
     })
+  }
+
+  /** Re-send the latest token usage so a client can redraw quota meters without waiting for a turn. */
+  private refreshUsageMeters(): void {
+    if (this.lastUsage) this.emit(this.usageWithMeters(this.lastUsage))
+  }
+
+  private usageWithMeters(update: Extract<SessionUpdate, { sessionUpdate: 'usage_update' }>): SessionUpdate {
+    return this.extensionMeters.length > 0 ? { ...update, _meta: { piAcp: { meters: this.extensionMeters } } } : update
   }
 
   /**
