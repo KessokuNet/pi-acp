@@ -47,15 +47,11 @@ On top of upstream it adds:
   - Tool results are forwarded as ACP content blocks, including images (pi's `read` can return a screenshot)
 - Usage and cost
   - `usage_update` reports context usage (`used`/`size`) and pi's cumulative session cost (`cost.amount`, in USD)
-  - When an extension status line looks like quota windows (`5h 88% ↻4h12m · 1w 89% ↻5d19h`, as `@specode/pi-subscription-usage` emits), the numbers ride along on `usage_update._meta.piAcp.meters` as `{label, percent, resetInMs, text}`, re-sent whenever the status changes, and dropped when the extension clears it. Zed ignores `_meta`, so nothing renders there yet
+  - Quota windows published by a status extension also ride on `usage_update._meta.piAcp.meters`; see [Extension integrations](#extension-integrations)
 - Configuration options
   - Model and thinking level are exposed as ACP `select` config options
-- Extension UI
-  - Notifications from pi extensions become ACP `notice` updates when the client advertises `session.notices`, and stay as assistant text otherwise. Both carry `_meta.piAcp.notify.level`
-  - `input` and `editor` extension requests are collected through `elicitation/create` (form mode) when the client advertises elicitation, and are cancelled with a visible note otherwise
-  - `select` extension requests become a single-choice elicitation form (`oneOf` options) for clients that advertise elicitation, so questionnaire tools such as `@juicesharp/rpiv-ask-user-question` render as real option lists; other clients still get the choices through `session/request_permission`
-  - `setTitle` extension requests are relayed as a `session_info_update`
-  - `setStatus` extension requests (the text-bar channel behind `/usage` and status extensions such as `@specode/pi-subscription-usage`) are republished as `session_info_update._meta.piAcp.status`, a map of status key to text, with an entry removed when the extension clears it. Clients that read `_meta` can render it; Zed does not, so its UI shows nothing
+- Extension UI and integrations
+  - Every pi extension UI request is relayed to an ACP equivalent: notices, permission prompts, elicitation forms, the session title, status text. A few extensions get dedicated handling because their events never reach RPC on their own. See [Extension integrations](#extension-integrations)
 - Session persistence
   - pi stores its own sessions in `~/.pi/agent/sessions/...`
   - `pi-acp` stores a small mapping file at `~/.pi/pi-acp/session-map.json` so `session/load` can reattach to a previous pi session file
@@ -76,6 +72,62 @@ On top of upstream it adds:
 - Skills are loaded by pi directly and are available in ACP sessions
 - (Zed) `pi-acp` emits “startup info” block into the session (pi version, context, skills, prompts, extensions - similar to `pi` in the terminal). You can disable it by setting `quietStartup: true` in pi settings (`~/.pi/agent/settings.json` or `<project>/.pi/settings.json`). When `quietStartup` is enabled, `pi-acp` will still emit a 'New version available' message if the installed pi version is outdated.
 - (Zed) Session history is supported in Zed starting with [`v0.225.0`](https://zed.dev/releases/preview/0.225.0). Session loading / history maps to pi's session files. Sessions can be resumed both in `pi` and in the ACP client.
+
+## Extension integrations
+
+pi-acp is an ACP host for pi's extension UI, so an extension written for the terminal keeps working
+in an ACP client. Every extension shares one UI surface, and each request has an ACP equivalent:
+
+| pi extension request | ACP update                                                                                                               |
+| -------------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| `notify`             | `notice` when the client advertises `session.notices`, assistant text otherwise; both carry `_meta.piAcp.notify.level`   |
+| `confirm`            | `session/request_permission` with yes/no options                                                                         |
+| `select`             | elicitation form with `oneOf` options; `session/request_permission` for clients without form elicitation                 |
+| `input`, `editor`    | elicitation form, or a visible note and a cancel when the client has none                                                |
+| `setTitle`           | `session_info_update.title`                                                                                              |
+| `setStatus`          | `session_info_update._meta.piAcp.status`, a map of status key to text with an entry removed when the extension clears it |
+
+`setWidget` and `setWorkingMessage` have no ACP equivalent and are dropped.
+
+Some extensions need more than that shared surface, because their data travels on pi's in-process
+event bus, which RPC does not forward. The bundled bridge extension (`src/pi-extension.ts`) runs
+inside pi, subscribes to those channels, and republishes each event as a persisted `CustomEntry`
+that crosses RPC as `entry_appended`.
+
+### `@tintinweb/pi-subagents`
+
+The live fleet and pi-subagents' own final records become one ACP `plan`, each subagent a task with
+`pending` / `in_progress` / `completed` status, and each spawned child is linked to its `Agent` tool
+call as an ACP subagent session. See [Subagents as tasks](#subagents-as-tasks).
+
+### Plan sources (`pi-cribsheet`)
+
+Anything publishing on the `plan:snapshot` and `plan:update` bus channels — `pi-cribsheet` is the
+reference producer — is merged per namespace and emitted as an ACP `plan`, tagged so a client can
+group it apart from the subagent fleet.
+
+### `pi-tasks`
+
+`TaskCreate` and `TaskUpdate` tool calls are read from the RPC event stream and folded into the same
+`plan`. No bridge code is involved; the tool calls carry everything.
+
+### `@specode/pi-subscription-usage`
+
+The footer text it writes with `setStatus` reaches `session_info_update._meta.piAcp.status`, and a
+status line shaped like quota windows (`5h 88% ↻4h12m · 1w 89% ↻5d19h`) is also parsed into
+`usage_update._meta.piAcp.meters` as `{label, percent, resetInMs, text}`. The meters are re-sent when
+the status changes and dropped when it clears. Zed ignores `_meta`, so none of this renders there yet.
+
+### `@juicesharp/rpiv-ask-user-question`
+
+Its RPC fallback walks a questionnaire through `select` and `input`, so pi-acp renders one elicitation
+option list per question, with the "Type something." row and the multi-select text input intact.
+Clients without form elicitation get the same choices through `session/request_permission`.
+
+### `@fahrizkyputra/pi-auto-resume`
+
+Its resume countdown arrives as `setStatus` text and its warnings as `notify`, so the countdown lands
+in the status map and the warnings land as `notice` updates.
 
 ## Prerequisites
 
