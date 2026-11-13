@@ -270,10 +270,7 @@ Other built-in commands:
 
 ## Subagents as tasks
 
-pi itself emits no ACP plans, so the ACP `plan` (task-list) channel is unused. When you use the
-[pi-subagents](https://github.com/tintinweb/pi-subagents) extension, pi-acp can surface the running
-subagent fleet as an ACP plan — each subagent becomes a task with `pending` / `in_progress` /
-`completed` status.
+pi's RPC stream carries no plan events, so pi-acp assembles the ACP `plan` (task-list) channel from the sources it can see: plan snapshots published on pi's bus, `TaskCreate` / `TaskUpdate` tool calls, and the subagent fleet. With the [pi-subagents](https://github.com/tintinweb/pi-subagents) extension installed, each running subagent becomes a task with `pending` / `in_progress` / `completed` status. See [Extension integrations](#extension-integrations) for the other two sources.
 
 Because pi's RPC mode does not forward pi's in-process event bus (`subagents:*`), the bridging is
 done by a pi extension. The `pi-acp` package doubles as that extension (`src/pi-extension.ts`,

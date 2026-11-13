@@ -1,8 +1,8 @@
 import type { PlanEntry } from '@agentclientprotocol/sdk/unstable'
 
 /**
- * Maps the pi-subagents fleet into an ACP Plan. pi itself emits no ACP plans, so the plan channel
- * is used to surface the subagent fleet as a task list.
+ * Maps the pi-subagents fleet into an ACP Plan. pi's RPC stream carries no plan events, so the plan
+ * channel is assembled from what pi-acp can observe; this module owns the subagent fleet.
  *
  * The producer is a companion pi extension (shipped in this package, see `src/pi-extension.ts`)
  * that subscribes to the `subagents:*` event bus and, for each change, persists a custom session
