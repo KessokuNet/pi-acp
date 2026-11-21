@@ -45,6 +45,7 @@ On top of upstream it adds:
   - For `edit`, `pi-acp` snapshots the file before the tool runs and emits an ACP **structured diff** (`oldText`/`newText`) on completion when possible
   - When the client advertises `fs.read_text_file`, that pre-edit snapshot comes from the client's editor buffer, so a diff reflects unsaved changes instead of what is on disk
   - Tool results are forwarded as ACP content blocks, including images (pi's `read` can return a screenshot)
+  - The pi-systemd extension's `bg` start/output calls render as display-only terminals: the command or unit id is the title, and the journal fills the terminal (streaming when `follow` is set)
 - Usage and cost
   - `usage_update` reports context usage (`used`/`size`) and pi's cumulative session cost (`cost.amount`, in USD)
   - Quota windows published by a status extension also ride on `usage_update._meta.piAcp.meters`; see [Extension integrations](#extension-integrations)

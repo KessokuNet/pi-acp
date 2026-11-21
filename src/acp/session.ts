@@ -20,14 +20,22 @@ import { expandSlashCommand, type FileSlashCommand } from './slash-commands.js'
 import {
   bashCommand,
   bashExitCode,
-  bashOutputDelta,
   bashResultText,
   bashTerminalContent,
   bashTerminalExitMeta,
   bashTerminalInfoMeta,
   bashTerminalOutputMeta,
-  isBashTool
+  isBashTool,
+  terminalOutputDelta
 } from './translate/bash.js'
+import {
+  bgAction,
+  bgTerminalCwd,
+  bgTerminalText,
+  bgTerminalTitle,
+  isBgTerminalAction,
+  isBgTool
+} from './translate/bg.js'
 import { toToolKind, toolResultContent, toolResultToText } from './translate/pi-tools.js'
 import { getToolPath, toToolCallLocations } from './translate/tool-args.js'
 
@@ -378,8 +386,8 @@ export class PiAcpSession {
   // events may need to be implemented in pi in the future.
   private fileSnapshots = new Map<string, FileSnapshot>()
   private fileMutationToolCallIds = new Set<string>()
-  private bashToolCallIds = new Set<string>()
-  private bashOutputSnapshots = new Map<string, string>()
+  private terminalToolCallIds = new Set<string>()
+  private terminalOutputSnapshots = new Map<string, string>()
   private taskPlan: TaskPlanState = newTaskPlanState()
   private piCodeTodos: TodoItem[] = []
   private goal: GoalItem | null = null
@@ -586,10 +594,11 @@ export class PiAcpSession {
   }
 
   /**
-   * Whether this client can render ACP terminals. Bash tool calls use the terminal `_meta`
-   * channel (terminal_output/terminal_exit) only when true; otherwise output is folded into a
-   * plain `content` text block so terminal-less clients (e.g. CodeCompanion) still render bash
-   * results instead of an empty shell.
+   * Whether this client can render ACP terminals. Tool calls that wrap a log (bash, and the
+   * pi-systemd `bg` start/output actions) use the terminal `_meta` channel
+   * (terminal_output/terminal_exit) only when true; otherwise output is folded into a plain
+   * `content` text block so terminal-less clients (e.g. CodeCompanion) still render results
+   * instead of an empty shell.
    */
   private clientSupportsTerminal(): boolean {
     return this.clientCapabilities?.terminal === true
@@ -605,21 +614,38 @@ export class PiAcpSession {
     return this.clientCapabilities?.elicitation?.form != null
   }
 
-  private emitBashToolCall(params: {
+  private isTerminalTool(toolName: string, args: unknown): boolean {
+    return isBashTool(toolName) || (isBgTool(toolName) && isBgTerminalAction(args))
+  }
+
+  private terminalTitle(toolName: string, args: unknown): string {
+    return isBashTool(toolName) ? (bashCommand(args) ?? toolName) : bgTerminalTitle(args)
+  }
+
+  private terminalCwd(toolName: string, args: unknown): string {
+    return isBgTool(toolName) ? bgTerminalCwd(args, this.cwd) : this.cwd
+  }
+
+  private terminalText(toolName: string, result: unknown): string {
+    return isBgTool(toolName) ? bgTerminalText(result) : bashResultText(result)
+  }
+
+  private emitTerminalToolCall(params: {
     sessionUpdate: 'tool_call' | 'tool_call_update'
     toolCallId: string
-    toolName: string
+    title: string
+    cwd: string
     args: unknown
     status: 'pending' | 'in_progress'
     locations?: ToolCallLocation[]
     includeTerminal: boolean
   }): void {
-    this.bashToolCallIds.add(params.toolCallId)
+    this.terminalToolCallIds.add(params.toolCallId)
     const useTerminal = params.includeTerminal && this.clientSupportsTerminal()
     this.emit({
       sessionUpdate: params.sessionUpdate,
       toolCallId: params.toolCallId,
-      title: bashCommand(params.args) ?? params.toolName,
+      title: params.title,
       kind: 'execute',
       status: params.status,
       locations: params.locations,
@@ -628,22 +654,22 @@ export class PiAcpSession {
       ...(useTerminal
         ? {
             content: bashTerminalContent(params.toolCallId),
-            _meta: bashTerminalInfoMeta(params.toolCallId, this.cwd)
+            _meta: bashTerminalInfoMeta(params.toolCallId, params.cwd)
           }
         : { rawInput: params.args })
     })
   }
 
-  private emitBashOutputUpdate(params: {
+  private emitTerminalOutputUpdate(params: {
     toolCallId: string
     status: 'in_progress' | 'completed' | 'failed'
+    text: string
+    exitCode: number
     result: unknown
-    isError?: boolean
   }): void {
-    const text = bashResultText(params.result)
-    const previous = this.bashOutputSnapshots.get(params.toolCallId) ?? ''
-    const delta = bashOutputDelta(previous, text)
-    this.bashOutputSnapshots.set(params.toolCallId, text)
+    const previous = this.terminalOutputSnapshots.get(params.toolCallId) ?? ''
+    const delta = terminalOutputDelta(previous, params.text)
+    this.terminalOutputSnapshots.set(params.toolCallId, params.text)
 
     const isDone = params.status === 'completed' || params.status === 'failed'
 
@@ -651,8 +677,8 @@ export class PiAcpSession {
     // output as a plain `content` text block. Content blocks replace rather than append, so we
     // send the full text (not the delta), plus the exit code on a non-zero completion.
     if (!this.clientSupportsTerminal()) {
-      const exitCode = bashExitCode(params.result, Boolean(params.isError))
-      const body = isDone && exitCode !== 0 ? `${text}\n\nexit code: ${exitCode}` : text
+      const text = bashResultText(params.result)
+      const body = isDone && params.exitCode !== 0 ? `${text}\n\nexit code: ${params.exitCode}` : text
       // Mirror the generic tool path: a content text block plus structured rawOutput, so clients
       // render (and can collapse) this as a proper tool call rather than a free-floating text block.
       this.emit({
@@ -673,7 +699,7 @@ export class PiAcpSession {
       status: params.status,
       _meta: {
         ...(delta ? bashTerminalOutputMeta(params.toolCallId, delta) : {}),
-        ...(isDone ? bashTerminalExitMeta(params.toolCallId, bashExitCode(params.result, Boolean(params.isError))) : {})
+        ...(isDone ? bashTerminalExitMeta(params.toolCallId, params.exitCode) : {})
       }
     })
   }
@@ -682,8 +708,8 @@ export class PiAcpSession {
     this.currentToolCalls.delete(toolCallId)
     this.fileSnapshots.delete(toolCallId)
     this.fileMutationToolCallIds.delete(toolCallId)
-    this.bashToolCallIds.delete(toolCallId)
-    this.bashOutputSnapshots.delete(toolCallId)
+    this.terminalToolCallIds.delete(toolCallId)
+    this.terminalOutputSnapshots.delete(toolCallId)
   }
 
   /**
@@ -912,16 +938,22 @@ export class PiAcpSession {
             // IMPORTANT: never downgrade status (e.g. if we already marked in_progress via tool_execution_start).
             const status = existingStatus ?? 'pending'
 
-            if (isBashTool(toolName)) {
+            if (isBgTool(toolName) && bgAction(rawInput) === undefined) {
+              // A bg call becomes a terminal only for start/output; wait for the action to stream.
+              break
+            }
+
+            if (this.isTerminalTool(toolName, rawInput)) {
               if (!existingStatus) this.currentToolCalls.set(toolCallId, 'pending')
-              this.emitBashToolCall({
+              this.emitTerminalToolCall({
                 sessionUpdate: existingStatus ? 'tool_call_update' : 'tool_call',
                 toolCallId,
-                toolName,
+                title: this.terminalTitle(toolName, rawInput),
+                cwd: this.terminalCwd(toolName, rawInput),
                 args: rawInput,
                 status,
                 locations,
-                includeTerminal: !existingStatus
+                includeTerminal: !this.terminalToolCallIds.has(toolCallId)
               })
             } else if (!existingStatus) {
               this.currentToolCalls.set(toolCallId, 'pending')
@@ -965,18 +997,19 @@ export class PiAcpSession {
         }
         if (toolName === AGENT_TOOL_NAME) this.subagents.onAgentToolStart(toolCallId, args)
 
-        if (isBashTool(toolName)) {
+        if (this.isTerminalTool(toolName, args)) {
           const locations = toToolCallLocations(args, this.cwd)
           const existingStatus = this.currentToolCalls.get(toolCallId)
           this.currentToolCalls.set(toolCallId, 'in_progress')
-          this.emitBashToolCall({
+          this.emitTerminalToolCall({
             sessionUpdate: existingStatus ? 'tool_call_update' : 'tool_call',
             toolCallId,
-            toolName,
+            title: this.terminalTitle(toolName, args),
+            cwd: this.terminalCwd(toolName, args),
             args,
             status: 'in_progress',
             locations,
-            includeTerminal: !existingStatus
+            includeTerminal: !this.terminalToolCallIds.has(toolCallId)
           })
           break
         }
@@ -1043,9 +1076,16 @@ export class PiAcpSession {
         const toolCallId = String((ev as any).toolCallId ?? '')
         if (!toolCallId) break
 
+        const toolName = String((ev as any).toolName ?? '')
         const partial = (ev as any).partialResult
-        if (this.bashToolCallIds.has(toolCallId)) {
-          this.emitBashOutputUpdate({ toolCallId, status: 'in_progress', result: partial })
+        if (this.terminalToolCallIds.has(toolCallId)) {
+          this.emitTerminalOutputUpdate({
+            toolCallId,
+            status: 'in_progress',
+            text: this.terminalText(toolName, partial),
+            exitCode: 0,
+            result: partial
+          })
           break
         }
 
@@ -1085,12 +1125,13 @@ export class PiAcpSession {
           this.subagents.onAgentToolEnd(toolCallId, result)
         }
 
-        if (this.bashToolCallIds.has(toolCallId)) {
-          this.emitBashOutputUpdate({
+        if (this.terminalToolCallIds.has(toolCallId)) {
+          this.emitTerminalOutputUpdate({
             toolCallId,
             status: isError ? 'failed' : 'completed',
-            result,
-            isError
+            text: this.terminalText(String((ev as any).toolName ?? ''), result),
+            exitCode: bashExitCode(result, isError),
+            result
           })
           this.cleanupToolCall(toolCallId)
           break

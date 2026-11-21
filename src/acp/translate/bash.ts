@@ -76,8 +76,15 @@ export function bashExitCode(result: unknown, isError: boolean): number {
   return typeof exitCode === 'number' ? exitCode : isError ? 1 : 0
 }
 
-export function bashOutputDelta(previous: string, next: string): string {
-  return next.startsWith(previous) ? next.slice(previous.length) : next
+/** Appended text between snapshots; the fallback covers bg's sliding `lines` window. */
+export function terminalOutputDelta(previous: string, next: string): string {
+  if (next.startsWith(previous)) return next.slice(previous.length)
+  if (!previous) return next
+  const max = Math.min(previous.length, next.length)
+  for (let length = max; length > 0; length -= 1) {
+    if (previous.endsWith(next.slice(0, length))) return next.slice(length)
+  }
+  return next
 }
 
 export function bashTerminalContent(toolCallId: string): ToolCallContent[] {

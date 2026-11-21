@@ -125,6 +125,98 @@ test('PiAcpSession: emits bash as a terminal when the client supports terminals'
   assert.equal((conn.updates[2]!.update as any).rawOutput, undefined)
 })
 
+test('PiAcpSession: emits bg log output as a terminal when the client supports terminals', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: [],
+    clientCapabilities: { terminal: true }
+  })
+
+  const args = { action: 'output', id: 'pi-systemd-tests-ab12', follow: true }
+  const body = (output: string[]) => ({
+    content: [{ type: 'text', text: `pi-systemd-tests-ab12.service: active/running\n${output.join('\n')}` }],
+    details: { output, exitCode: 0 }
+  })
+
+  proc.emit({ type: 'tool_execution_start', toolCallId: 't1', toolName: 'bg', args })
+  proc.emit({
+    type: 'tool_execution_update',
+    toolCallId: 't1',
+    toolName: 'bg',
+    partialResult: body(['line 1', 'line 2'])
+  })
+  proc.emit({
+    type: 'tool_execution_update',
+    toolCallId: 't1',
+    toolName: 'bg',
+    partialResult: body(['line 1', 'line 2', 'line 3'])
+  })
+  proc.emit({
+    type: 'tool_execution_end',
+    toolCallId: 't1',
+    toolName: 'bg',
+    isError: false,
+    result: body(['line 1', 'line 2', 'line 3'])
+  })
+
+  await new Promise(r => setTimeout(r, 0))
+
+  assert.equal(conn.updates.length, 4)
+
+  assert.equal(conn.updates[0]!.update.sessionUpdate, 'tool_call')
+  assert.equal((conn.updates[0]!.update as any).toolCallId, 't1')
+  assert.equal((conn.updates[0]!.update as any).title, 'bg output pi-systemd-tests-ab12')
+  assert.equal((conn.updates[0]!.update as any).kind, 'execute')
+  assert.equal((conn.updates[0]!.update as any).status, 'in_progress')
+  assert.deepEqual((conn.updates[0]!.update as any).content, [{ type: 'terminal', terminalId: 't1' }])
+  assert.deepEqual((conn.updates[0]!.update as any)._meta, {
+    terminal_info: { terminal_id: 't1', cwd: process.cwd() }
+  })
+
+  assert.deepEqual((conn.updates[1]!.update as any)._meta, {
+    terminal_output: { terminal_id: 't1', data: 'line 1\nline 2' }
+  })
+
+  assert.deepEqual((conn.updates[2]!.update as any)._meta, {
+    terminal_output: { terminal_id: 't1', data: '\nline 3' }
+  })
+
+  assert.equal((conn.updates[3]!.update as any).status, 'completed')
+  assert.deepEqual((conn.updates[3]!.update as any)._meta, {
+    terminal_exit: { terminal_id: 't1', exit_code: 0, signal: null }
+  })
+})
+
+test('PiAcpSession: leaves bg status calls as ordinary tool calls', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: [],
+    clientCapabilities: { terminal: true }
+  })
+
+  proc.emit({ type: 'tool_execution_start', toolCallId: 't1', toolName: 'bg', args: { action: 'status', id: 'x' } })
+
+  await new Promise(r => setTimeout(r, 0))
+
+  assert.equal(conn.updates.length, 1)
+  assert.equal((conn.updates[0]!.update as any).kind, 'other')
+  assert.equal((conn.updates[0]!.update as any).content, undefined)
+})
+
 test('PiAcpSession: emits bash as content text blocks when the client lacks terminals', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()
