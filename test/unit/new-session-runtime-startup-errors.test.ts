@@ -70,6 +70,57 @@ test('PiAcpAgent: newSession returns AUTH_REQUIRED when pi reports an auth error
   assert.equal(store.get('s-auth'), null)
 })
 
+test('PiAcpAgent: newSession accepts an empty model list when the session already has a model', async () => {
+  const conn = new FakeAgentSideConnection()
+  const root = mkdtempSync(join(tmpdir(), 'pi-acp-runtime-resolved-'))
+  const sessionFile = join(root, 'sessions', 'resolved.jsonl')
+  const sessionMapPath = join(root, 'session-map.json')
+
+  mkdirSync(join(root, 'sessions'), { recursive: true })
+  writeFileSync(
+    sessionFile,
+    JSON.stringify({
+      type: 'session',
+      version: 3,
+      id: 's-resolved',
+      timestamp: '2026-05-07T00:00:00.000Z',
+      cwd: process.cwd()
+    }) + '\n',
+    'utf-8'
+  )
+
+  // A gateway provider an extension registers is missing from pi's availability
+  // list, but the session runs the configured model all the same.
+  const session = {
+    sessionId: 's-resolved',
+    cwd: process.cwd(),
+    proc: {
+      async getAvailableModels() {
+        return { models: [] }
+      },
+      async getState() {
+        return {
+          thinkingLevel: 'medium',
+          model: { id: 'aperture/DeepSeek-V4.1-Flash-1017', provider: 'bifrost' },
+          sessionFile
+        }
+      }
+    }
+  }
+
+  const sessions = new FakeSessions(session)
+  const store = new SessionStore(sessionMapPath)
+  store.upsert({ sessionId: 's-resolved', cwd: process.cwd(), sessionFile })
+  const agent = new PiAcpAgent(asAgentConn(conn), {} as any)
+  ;(agent as any).sessions = sessions as any
+  ;(agent as any).store = store as any
+
+  const res = await agent.newSession({ cwd: process.cwd(), mcpServers: [] } as any)
+
+  assert.equal(res.sessionId, 's-resolved')
+  assert.deepEqual(sessions.closeCalls, [])
+})
+
 test('PiAcpAgent: newSession returns Internal error on non-auth model probe failures after spawn', async () => {
   const conn = new FakeAgentSideConnection()
 

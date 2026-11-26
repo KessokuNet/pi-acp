@@ -412,10 +412,16 @@ export class PiAcpAgent {
       throw RequestError.internalError({}, String((availableModelsErr as Error)?.message ?? availableModelsErr))
     }
 
-    // If pi has no models available after spawning, it's effectively unauthenticated.
+    // pi-ai's availability filter lists only the providers it can resolve a
+    // credential for on its own, so a provider an extension registers (a
+    // gateway or a proxy) can be absent from it while the session still runs
+    // the configured model. A resolved model in the state is what makes the
+    // agent usable; the list only feeds the model picker.
     const rawModelsCount = Array.isArray(availableModels?.models) ? availableModels.models.length : 0
+    const sessionModel = (state as { model?: unknown } | null)?.model
+    const hasSessionModel = typeof sessionModel === 'object' && sessionModel !== null
 
-    if (rawModelsCount === 0) {
+    if (rawModelsCount === 0 && !hasSessionModel) {
       this.cleanupFailedNewSession(session.sessionId, state)
       throw RequestError.authRequired(
         { authMethods: getAuthMethods() },
